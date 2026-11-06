@@ -1,0 +1,64 @@
+{
+  "name": "@precinct/quire",
+  "version": "0.1.1",
+  "description": "文档：让 dsh 的 Agent 读、建、改 Word、Excel 和 PowerPoint 文件；dsh web 侧栏里可直接预览、编辑和标注",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "dsh-bundle",
+    "deepseek",
+    "deepseek-harness",
+    "office",
+    "word",
+    "excel",
+    "powerpoint",
+    "docx",
+    "xlsx",
+    "pptx",
+    "document-editor",
+    "agent-tools"
+  ],
+  "author": "Precinct series contributors",
+  "homepage": "https://github.com/yiyiSmallti/quire#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yiyiSmallti/quire.git",
+    "directory": "plugin"
+  },
+  "bugs": {
+    "url": "https://github.com/yiyiSmallti/quire/issues"
+  },
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "dsh": ">=0.2.1-rc.5 <0.3.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-sidebar-documentpreview",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "dependencies": {},
+  "publishConfig": {
+    "access": "public"
+  }
+}

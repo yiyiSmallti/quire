@@ -1,0 +1,44 @@
+{
+  "format": 1,
+  "title": { "en": "Quire", "zh": "Quire" },
+  "description": {
+    "en": "Office documents for DeepSeek Harness: the agent reads and edits Word, Excel and PowerPoint files, and dsh web opens them in an editor.",
+    "zh": "DeepSeek Harness 的 Office 文档插件：Agent 读写 Word、Excel、PowerPoint，dsh web 侧边栏里直接编辑。"
+  },
+  "metadata": {
+    "categories": {
+      "documents": { "title": { "en": "Documents", "zh": "文档" } }
+    },
+    "labels": {
+      "web": { "title": { "en": "dsh web", "zh": "dsh web" } },
+      "agent-tools": { "title": { "en": "Agent tools", "zh": "Agent 工具" } }
+    }
+  },
+  "plugins": [
+    {
+      "name": "@precinct/quire",
+      "title": { "en": "Quire: Word, Excel and PowerPoint", "zh": "Quire：Word、Excel 与 PowerPoint" },
+      "description": {
+        "en": "Agent tools that read, create and edit .docx/.xlsx/.pptx in place, plus an Office-style editor in the dsh web side bar with box-select annotations sent to the agent with a screenshot.",
+        "zh": "Agent 工具读、新建、修改 .docx/.xlsx/.pptx，只改要改的地方；dsh web 侧边栏里是 Office 式编辑器，框选标注连同截图随消息发给 Agent。"
+      },
+      "icon": "icon.svg",
+      "author": "Precinct series contributors",
+      "homepage": "https://github.com/yiyiSmallti/quire#readme",
+      "repository": { "url": "https://github.com/yiyiSmallti/quire", "directory": "plugin" },
+      "metadata": {
+        "category": "documents",
+        "keywords": ["office", "word", "excel", "powerpoint", "docx", "xlsx", "pptx", "文档", "表格", "演示", "标注"],
+        "labels": ["web", "agent-tools"]
+      },
+      "versions": [
+        {
+          "version": "0.1.1",
+          "publishTimestamp": 1793957849,
+          "source": { "type": "npm" },
+          "engines": { "dsh": ">=0.2.1-rc.5 <0.3.0" }
+        }
+      ]
+    }
+  ]
+}
