@@ -94,7 +94,15 @@ export async function dismissDialogs (p) {
 
 // enterSession opens the Session by its title and the right Sidebar's
 // workspace files.
-export async function enterSession (p, title) {
+export async function enterSession (p, title, folder) {
+  // dsh web 0.2.2 files workspaces under collapsed groups (未分组 by
+  // default): open the group, then the workspace, until the Session shows.
+  for (const name of ['未分组', folder].filter(Boolean)) {
+    if (await p.js(`return !!__q.byText(${jsStr(title)}, false)`).catch(() => false) === true) break
+    if (await p.js(`return !!__q.byText(${jsStr(name)}, false)`).catch(() => false) !== true) continue
+    await p.clickText(name, false)
+    await sleep(500)
+  }
   let e
   for (let i = 0; i < 3; i++) {
     e = await attempt(async () => {
@@ -115,11 +123,15 @@ export async function enterSession (p, title) {
 // Sidebar.
 export function opener (p) {
   return async (name) => {
-    if (await p.js(`return !!__q.byText(${jsStr(name)}, true)`).catch(() => false) !== true) {
+    const listed = () => p.js(`return !!__q.byText(${jsStr(name)}, true)`).catch(() => false)
+    // A click on the 文件 tab can land while the tab strip is still
+    // scrolling or re-rendering; click again until the file list shows.
+    for (let i = 0; i < 3 && await listed() !== true; i++) {
       // With many files open the side bar's tab strip scrolls; bring
       // its first tab (文件) back into view.
       await p.js(`for (const e of document.querySelectorAll('body *')) { if (e.closest('.quire') || ![...e.childNodes].some((n) => n.nodeType === 3 && n.data.trim() === '文件')) continue; let b = e; while (b && !b.getBoundingClientRect().width) b = b.parentElement; b?.scrollIntoView({ block: 'nearest', inline: 'nearest' }) } return true`).catch(() => {})
       await p.clickText('文件', true)
+      await p.waitJS(`return !!__q.byText(${jsStr(name)}, true)`, 5000).catch(() => {})
     }
     await p.clickText(name, true)
   }
@@ -186,7 +198,7 @@ async function suite (s, cleanup) {
   await dismissDialogs(p)
   const open = opener(p)
   err = await attempt(async () => {
-    await enterSession(p, '看一下这几个文件')
+    await enterSession(p, '看一下这几个文件', 'ws')
     await open('预算.xlsx')
     await p.waitJS(`return !!document.querySelector('.quire .qx-canvas') && document.querySelector('.qx-tab')?.textContent === '明细'`, 20000)
   })

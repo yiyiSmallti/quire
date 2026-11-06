@@ -122,7 +122,7 @@ node e2e/run.mjs
 
 README 的截图用 `node e2e/shots.mjs` 重拍：示例工作区由 `e2e/gen/demo.mjs` 生成，图写到 `docs/images/`。
 
-需要 node 和 PATH 上的 dsh 0.2.1-rc.x（或 `QUIRE_E2E_DSH`，可指向 bin.js 配 `QUIRE_E2E_NODE`）；web 还需要 Chrome 或 Edge（或 `QUIRE_E2E_CHROME`）。
+需要 node 和 PATH 上的 dsh 0.2.x（0.2.1-rc.5 起，已在 0.2.2-rc.1 上跑通；或 `QUIRE_E2E_DSH`，可指向 bin.js 配 `QUIRE_E2E_NODE`）；web 还需要 Chrome 或 Edge（或 `QUIRE_E2E_CHROME`）。
 
 ## 许可
 

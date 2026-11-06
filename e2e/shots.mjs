@@ -48,7 +48,7 @@ async function shots () {
   const p = new Page(c)
   await p.waitJS(`return !!document.getElementById('quire-editor-css')`, 30000)
   await dismissDialogs(p)
-  await enterSession(p, PROMPT)
+  await enterSession(p, PROMPT, '季度经营')
   const open = opener(p)
   fs.mkdirSync(OUT, { recursive: true })
   // The side bar names the file by its absolute path, a temp folder here.
