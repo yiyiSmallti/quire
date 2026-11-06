@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Quire: Word, Excel and PowerPoint",
+    "description": "The agent reads, creates and edits .docx/.xlsx/.pptx in place; edit and annotate them in the dsh web side bar."
+  }
+}
