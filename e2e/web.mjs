@@ -27,7 +27,7 @@ function notesOf (file) {
 
 // startWeb runs dsh web in the workspace on a free port and returns its
 // signed-in address; the address carries a token, so it is never logged.
-function startWeb (d, ws, model, cleanup) {
+export function startWeb (d, ws, model, cleanup) {
   const [cmd, ...rest] = d.argv('--profile', 'quire-web', '--no-open', '--port', '0')
   const child = spawn(cmd, rest, {
     cwd: ws,
@@ -78,6 +78,53 @@ print('；'.join(out))`
   })
 }
 
+// dismissDialogs clears what a fresh home shows first, a preview notice and
+// a sign-in prompt; the editor needs neither. They come up a moment after
+// load, one after the other.
+export async function dismissDialogs (p) {
+  for (const end = Date.now() + 8000; Date.now() < end; await sleep(400)) {
+    let v
+    try {
+      v = await p.js(`const d = [...document.querySelectorAll('[role=dialog]')].find((e) => __q.vis(e)); if (!d) return 'none'; const b = [...d.querySelectorAll('button')].find((b) => b.textContent.trim() === '继续') ?? d.querySelector('button[aria-label="关闭"], button[aria-label="Close"]'); return b ? __q.centre(b) : 'esc'`)
+    } catch {}
+    if (v === 'esc') await p.key('Escape').catch(() => {})
+    else if (v && typeof v === 'object') await p.click(pt(v).x, pt(v).y, 1).catch(() => {})
+  }
+}
+
+// enterSession opens the Session by its title and the right Sidebar's
+// workspace files.
+export async function enterSession (p, title) {
+  let e
+  for (let i = 0; i < 3; i++) {
+    e = await attempt(async () => {
+      await p.clickText(title, false)
+      await p.waitJS(`return document.title.includes(${jsStr(title)})`, 4000)
+    })
+    if (!e) break
+  }
+  if (e) throw e
+  await sleep(1000)
+  if (await p.js(`return !!__q.byText('工作区文件', true)`).catch(() => false) !== true) {
+    await p.clickJS(`return __q.centre(document.querySelector('button[aria-label="打开右侧边栏"]'))`)
+  }
+  await p.clickText('工作区文件', true)
+}
+
+// opener returns open, which shows a file of the workspace in the right
+// Sidebar.
+export function opener (p) {
+  return async (name) => {
+    if (await p.js(`return !!__q.byText(${jsStr(name)}, true)`).catch(() => false) !== true) {
+      // With many files open the side bar's tab strip scrolls; bring
+      // its first tab (文件) back into view.
+      await p.js(`for (const e of document.querySelectorAll('body *')) { if (e.closest('.quire') || ![...e.childNodes].some((n) => n.nodeType === 3 && n.data.trim() === '文件')) continue; let b = e; while (b && !b.getBoundingClientRect().width) b = b.parentElement; b?.scrollIntoView({ block: 'nearest', inline: 'nearest' }) } return true`).catch(() => {})
+      await p.clickText('文件', true)
+    }
+    await p.clickText(name, true)
+  }
+}
+
 export async function web (rep) {
   const s = rep.section('dsh web：人在右侧栏直接编辑 Word / Excel / PowerPoint')
   const cleanup = new Cleanup()
@@ -109,6 +156,7 @@ async function suite (s, cleanup) {
     chart(path.join(ws, 'chart.png'))
     await run({}, work, node, [path.join(gen, 'fixture.mjs'), lib, ws])
     await run({}, work, node, [path.join(gen, 'big.mjs'), lib, ws])
+    await run({}, work, node, [path.join(gen, 'smartart.mjs'), lib, path.join(ws, '流程.pptx')])
     const tgz = packPlugin(work)
     await d.install('quire-e2e', tgz)
     const turn = await d.turn('quire-e2e', ws, model, '看一下这几个文件')
@@ -135,42 +183,10 @@ async function suite (s, cleanup) {
   }
 
   // Open the Session, the right Sidebar's files, then each file.
-  // A fresh home first shows a preview notice and a sign-in prompt;
-  // the editor needs neither. They come up a moment after load, one after
-  // the other.
-  for (const end = Date.now() + 8000; Date.now() < end; await sleep(400)) {
-    let v
-    try {
-      v = await p.js(`const d = [...document.querySelectorAll('[role=dialog]')].find((e) => __q.vis(e)); if (!d) return 'none'; const b = [...d.querySelectorAll('button')].find((b) => b.textContent.trim() === '继续') ?? d.querySelector('button[aria-label="关闭"], button[aria-label="Close"]'); return b ? __q.centre(b) : 'esc'`)
-    } catch {}
-    if (v === 'esc') await p.key('Escape').catch(() => {})
-    else if (v && typeof v === 'object') await p.click(pt(v).x, pt(v).y, 1).catch(() => {})
-  }
-  // open shows a file of the workspace in the right Sidebar.
-  const open = async (name) => {
-    if (await p.js(`return !!__q.byText(${jsStr(name)}, true)`).catch(() => false) !== true) {
-      // With many files open the side bar's tab strip scrolls; bring
-      // its first tab (文件) back into view.
-      await p.js(`for (const e of document.querySelectorAll('body *')) { if (e.closest('.quire') || ![...e.childNodes].some((n) => n.nodeType === 3 && n.data.trim() === '文件')) continue; let b = e; while (b && !b.getBoundingClientRect().width) b = b.parentElement; b?.scrollIntoView({ block: 'nearest', inline: 'nearest' }) } return true`).catch(() => {})
-      await p.clickText('文件', true)
-    }
-    await p.clickText(name, true)
-  }
+  await dismissDialogs(p)
+  const open = opener(p)
   err = await attempt(async () => {
-    let e
-    for (let i = 0; i < 3; i++) {
-      e = await attempt(async () => {
-        await p.clickText('看一下这几个文件', false)
-        await p.waitJS(`return document.title.includes('看一下这几个文件')`, 4000)
-      })
-      if (!e) break
-    }
-    if (e) throw e
-    await sleep(1000)
-    if (await p.js(`return !!__q.byText('工作区文件', true)`).catch(() => false) !== true) {
-      await p.clickJS(`return __q.centre(document.querySelector('button[aria-label="打开右侧边栏"]'))`)
-    }
-    await p.clickText('工作区文件', true)
+    await enterSession(p, '看一下这几个文件')
     await open('预算.xlsx')
     await p.waitJS(`return !!document.querySelector('.quire .qx-canvas') && document.querySelector('.qx-tab')?.textContent === '明细'`, 20000)
   })
@@ -182,6 +198,7 @@ async function suite (s, cleanup) {
   await spreadsheet(s, p, ws, work, lib, node)
   await documentSteps(s, p, ws, open)
   await presentation(s, p, ws, open)
+  await objects(s, p, ws, open)
   await bigFiles(s, p, ws, open)
   await pins(s, p, open, model)
 
@@ -312,6 +329,11 @@ async function spreadsheet (s, p, ws, work, lib, node) {
     await p.waitJS(`return document.querySelectorAll('.qx-chart.on svg rect').length >= 4`, 10000)
   })
   s.step('表格：选中 A1:C3 插入柱形图，系列引用 B2:B3、分类 A2:A3，网格上画出图表', err)
+  // Row 2 is hidden by the filter: like Excel, the chart leaves it out.
+  err = err ?? await attempt(async () => {
+    await p.waitJS(`const t = document.querySelector('.qx-chart svg')?.textContent ?? ''; return t.length > 0 && !t.includes('带宽')`, 10000)
+  })
+  s.step('表格：筛选隐藏的第 2 行（带宽）不画进图表，系列引用不变', err)
   await p.shot('web-xlsx-chart.png')
 
   const drawing0 = partsLike(xlsx, 'xl/drawings/drawing')
@@ -338,6 +360,25 @@ async function spreadsheet (s, p, ws, work, lib, node) {
     await p.waitJS(`return document.querySelectorAll('.qx-chart svg path').length >= 2`, 10000)
   })
   s.step('表格：右键图表改成折线图', err)
+
+  err = err ?? await attempt(async () => {
+    await p.waitJS(`return !!document.querySelector('.qx-chart')`, 10000)
+    const b = pt(await p.js(chartCorner))
+    await p.rclick(b.x, b.y)
+    await p.clickJS(`const b = [...document.querySelectorAll('.q-menu button')].find((b) => b.textContent.trim() === '图表选项…'); return b && __q.centre(b)`)
+    await p.waitJS(`return !!document.querySelector('.q-dlg[aria-label="图表选项"]')`, 5000)
+    await p.js(`const rows = [...document.querySelectorAll('.q-dlg .q-dlg-row')]; const f = (l) => rows.find((r) => r.firstChild.textContent === l).querySelector('select, input')
+      const set = (n, v) => { if (n.type === 'checkbox') n.checked = v; else n.value = v; n.dispatchEvent(new Event(n.tagName === 'SELECT' || n.type === 'checkbox' ? 'change' : 'input', { bubbles: true })) }
+      set(f('数据标签'), 'value'); set(f('数值轴标题'), '金额'); set(f('数值轴最小值'), '0'); set(f('主要网格线'), false); return true`)
+    await p.clickJS(`return __q.centre(document.querySelector('.q-dlg .q-dlg-ok'))`)
+    await waitFile(xlsx, '', () => {
+      const c = charts()
+      return /<c:dLbls>(?:(?!<\/c:dLbls>).)*<c:showVal val="1"\/>/s.test(c) && c.includes('金额') && !c.includes('<c:majorGridlines') && c.includes('<c:min val="0"/>')
+    })
+    await p.waitJS(`return (document.querySelector('.qx-chart svg')?.textContent ?? '').includes('金额')`, 10000)
+  })
+  s.step('表格：右键「图表选项…」打开数据标签、写数值轴标题和最小值、关掉网格线，写进图表部件并画出来', err)
+  await p.shot('web-xlsx-chart-look.png')
 
   err = err ?? await attempt(async () => {
     await p.waitJS(`return !!document.querySelector('.qx-chart')`, 10000)
@@ -460,10 +501,12 @@ async function documentSteps (s, p, ws, open) {
   err = await attempt(async () => {
     await p.js(`const p = document.querySelector('.qd-page > .qd-p'); document.querySelector('.qd-page').focus(); const r = document.createRange(); r.selectNodeContents(p); r.collapse(true); getSelection().removeAllRanges(); getSelection().addRange(r); return true`)
     await p.clickJS(`return __q.centre(__q.reveal(document.querySelector('.quire button[aria-label^="插入目录"]')))`)
-    await waitFile(docx, doc, (x) => x.includes('TOC \\o "1-3"') && x.includes('_Toc') && x.indexOf('TOC \\o') < x.indexOf('>季度报告<'))
-    await p.waitJS(`return document.querySelectorAll('.qd-p[data-toc]').length >= 3 && [...document.querySelectorAll('.qd-p[data-toc]')].some((e) => e.textContent.includes('结论'))`, 10000)
+    await waitFile(docx, doc, (x) => x.includes('TOC \\o "1-3"') && x.includes('_Toc') && x.indexOf('TOC \\o') < x.indexOf('>季度报告<') &&
+      count(x, 'PAGEREF _Toc') === 2 && x.includes('w:leader="dot"'))
+    await p.waitJS(`return document.querySelectorAll('.qd-p[data-toc]').length >= 3 && [...document.querySelectorAll('.qd-p[data-toc]')].some((e) => e.textContent.includes('结论')) &&
+      document.querySelectorAll('.qd-tocp > .qd-leader').length === 2 && [...document.querySelectorAll('.qd-tocp')].every((e) => /\\t\\d+$/.test(e.textContent))`, 10000)
   })
-  s.step('文档：在开头插入目录（TOC 域 + 书签），目录列出「季度报告」「结论」', err)
+  s.step('文档：在开头插入目录（TOC 域 + 书签），目录列出「季度报告」「结论」，每项带点线和页码（PAGEREF）', err)
 
   err = await attempt(async () => {
     await p.js(`const p = [...document.querySelectorAll('.qd-page > .qd-p')].find((e) => !e.dataset.toc && e.textContent === '结论'); document.querySelector('.qd-page').focus(); const r = document.createRange(); r.selectNodeContents(p); r.collapse(false); getSelection().removeAllRanges(); getSelection().addRange(r); return true`)
@@ -474,6 +517,16 @@ async function documentSteps (s, p, ws, open) {
     await p.waitJS(`return [...document.querySelectorAll('.qd-p[data-toc]')].some((e) => e.textContent.includes('结论与展望'))`, 10000)
   })
   s.step('文档：标题改成「结论与展望」后更新目录，目录项跟着变', err)
+
+  // A table copied from a web page or another editor comes in as a table.
+  const tables0 = count(zipPartOr(docx, doc), '<w:tbl>')
+  err = await attempt(async () => {
+    await p.js(selectPara)
+    await p.js(`const dt = new DataTransfer(); dt.setData('text/html', '<meta charset="utf-8"><table><thead><tr><th>季度</th><th>收入</th></tr></thead><tbody><tr><td>Q1</td><td>110</td></tr><tr><td>Q2</td><td>120<br>（预估）</td></tr></tbody></table>'); dt.setData('text/plain', '季度\\t收入\\nQ1\\t110\\nQ2\\t120'); document.querySelector('.qd-page').dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true })); return true`)
+    await waitFile(docx, doc, (x) => count(x, '<w:tbl>') === tables0 + 1 && /<w:t[^>]*>Q2<\/w:t>/.test(x) && /120<\/w:t><\/w:r><w:r>(?:<w:rPr>(?:(?!<\/w:rPr>).)*<\/w:rPr>)?<w:br\/>/.test(x) && x.includes('<w:tblHeader/>'))
+    await p.waitJS(`return [...document.querySelectorAll('.qd-t')].some((t) => t.textContent.includes('Q2') && t.textContent.includes('季度'))`, 10000)
+  })
+  s.step('文档：粘贴网页里复制的 HTML 表格，插成 Word 表格（表头行、单元格内换行）', err)
   await p.shot('web-docx-more.png')
   await p.shot('web-docx.png')
 }
@@ -609,6 +662,45 @@ async function presentation (s, p, ws, open) {
   s.step('演示：放映从当前页开始，→ 翻到第 2 页，Esc 退出', err)
   await p.shot('web-pptx.png')
 
+  // Emphasis and exit effects: the copy flies out, the first star pulses.
+  const setAnim = (v) => `const s = __q.reveal(document.querySelector('.quire select[aria-label="动画效果"]')); s.value = ${jsStr(v)}; s.dispatchEvent(new Event('change', { bubbles: true })); return true`
+  err = await attempt(async () => {
+    await p.clickJS(`return __q.centre(document.querySelectorAll('.qp-thumb')[0])`)
+    // The two stars are still selected from the steps before.
+    await p.key('Escape')
+    await p.waitJS(`return document.querySelector('.qp-box').hidden && document.querySelectorAll('.qp-ol').length === 0`, 5000)
+    // The master's text box is drawn on the slide too: find the stars by shape.
+    const stars = `[...document.querySelectorAll('.qp-stage [data-k]')].filter((n) => n.outerHTML.slice(0, 3000).includes('polygon('))`
+    await p.waitJS(`return ${stars}.length === 2`, 5000)
+    await p.clickJS(`const ns = ${stars}; return __q.centre(ns[1])`)
+    await p.waitJS(`/* copy */ return !document.querySelector('.qp-box').hidden && document.querySelectorAll('.qp-ol').length === 0`, 5000)
+    await p.js(setAnim('exit:fly'))
+    await waitFile(pptx, slide1, (x) => x.includes('presetClass="exit"') && x.includes('presetID="2"') && x.includes('<p:strVal val="hidden"/>'))
+    const at = await p.js(`const r = ${stars}[0].getBoundingClientRect(); return { x: r.left + r.width / 2, y: r.top + r.height * 0.07 }`)
+    await p.click(pt(at).x, pt(at).y, 1)
+    await p.waitJS(`/* first */ return !document.querySelector('.qp-box').hidden && document.querySelectorAll('.qp-ol').length === 0`, 5000)
+    await p.js(setAnim('emph:pulse'))
+    await waitFile(pptx, slide1, (x) => x.includes('presetClass="emph"') && x.includes('presetID="26"') && x.includes('presetClass="exit"') && x.includes('autoRev="1"'))
+    await p.waitJS(`return document.querySelectorAll('.qp-badge').length === 2`, 10000)
+  })
+  s.step('演示：一个星形加「强调 · 脉冲」、另一个加「退出 · 飞出」，写成 emph / exit 动画（退出结束时隐藏）', err)
+
+  // A blocked audience window: the slides go full screen in this window.
+  err = await attempt(async () => {
+    await p.js(`window.__open = window.open; window.open = () => null; return true`)
+    await p.clickJS(`return __q.centre(__q.reveal(document.querySelector('.qp').closest('.quire').querySelector('button[aria-label^="放映时显示备注"]')))`)
+    await p.waitJS(`return !!document.querySelector('.qp-show .qp-pv')`, 5000)
+    await p.clickJS(`return __q.centre([...document.querySelectorAll('.qp-show button')].find((b) => b.textContent === '观众窗口'))`)
+    await p.waitJS(`const s = document.querySelector('.qp-show'); return s.classList.contains('qp-solo') && !__q.vis(s.querySelector('.qp-pv')) && __q.vis(s.querySelector('.qp-solo-back'))`, 5000)
+    await p.shot('web-pptx-solo.png')
+    await p.clickJS(`return __q.centre(document.querySelector('.qp-solo-back'))`)
+    await p.waitJS(`const s = document.querySelector('.qp-show'); return !s.classList.contains('qp-solo') && __q.vis(s.querySelector('.qp-pv'))`, 5000)
+    await p.key('Escape')
+    await p.waitJS(`return !document.querySelector('.qp-show')`, 5000)
+  })
+  await p.js(`if (window.__open) window.open = window.__open; return true`).catch(() => {})
+  s.step('演示：浏览器拦截观众窗口时，改在本窗口全屏显示观众画面，右下角按钮切回演示者视图', err)
+
   err = await attempt(async () => {
     await p.clickJS(`return __q.centre(__q.reveal(document.querySelector('.qp').closest('.quire').querySelector('button[aria-label^="新建空白"]')))`)
     await p.waitJS(`return [...document.querySelectorAll('.q-menu button')].some((b) => b.textContent.includes('空白 Word 文档'))`, 5000)
@@ -620,6 +712,80 @@ async function presentation (s, p, ws, open) {
   })
   s.step('通用：文件 › 新建 › 空白 Word 文档，写进工作区并在新标签里用 Quire 打开', err)
   await p.shot('web-new-docx.png')
+}
+
+// --------------------------------------------- objects PowerPoint wrote
+
+// objects edits a deck with a SmartArt diagram, a table and a group, the
+// way PowerPoint saves them (gen/smartart.mjs).
+async function objects (s, p, ws, open) {
+  const pptx = path.join(ws, '流程.pptx')
+  const data = 'ppt/diagrams/data1.xml'
+  const drawing = 'ppt/diagrams/drawing1.xml'
+  const editIn = (sel, text) => async () => {
+    await p.clickJS(`return __q.centre(${sel})`, 2)
+    await p.waitJS(`return !!document.querySelector('.qp-editing')`, 5000)
+    await p.key('a', 'mod')
+    await p.typeText(text)
+    await p.key('Escape')
+  }
+  const node = (t) => `[...document.querySelectorAll('.qp-stage [data-sa]')].find((e) => e.textContent.includes(${jsStr(t)}))`
+  let err = await attempt(async () => {
+    await open('流程.pptx')
+    await p.waitJS(`return document.querySelectorAll('.quire .qp-thumb').length === 3 && document.querySelectorAll('.qp-stage [data-sa]').length >= 3`, 20000)
+    await editIn(node('方案设计'), '方案评审')()
+    await waitFile(pptx, data, (x) => x.includes('>方案评审<') && !x.includes('方案设计'), () => zipPartOr(pptx, drawing).includes('>方案评审<'))
+  })
+  s.step('SmartArt：双击节点「方案设计」改写，数据模型和 PowerPoint 存的绘图都改了', err)
+
+  // 开发上线 draws its child 灰度发布 as an indented second line.
+  err = err ?? await attempt(async () => {
+    await p.clickJS(`return __q.centre(${node('开发上线')})`, 2)
+    await p.waitJS(`return !!document.querySelector('.qp-editing')`, 5000)
+    await p.js(`const n = document.querySelector('.qp-editing'); const t = [...n.querySelectorAll('p')].pop(); const w = document.createTreeWalker(t, NodeFilter.SHOW_TEXT); let x, last; while ((x = w.nextNode())) last = x; const r = document.createRange(); r.selectNodeContents(last); getSelection().removeAllRanges(); getSelection().addRange(r); return true`)
+    await p.typeText('全量发布')
+    await p.key('Escape')
+    await waitFile(pptx, data, (x) => x.includes('>全量发布<') && x.includes('>开发上线<') && !x.includes('灰度发布'),
+      () => /<a:pPr[^>]*lvl="1"[^>]*\/?>(?:(?!<\/a:p>).)*全量发布/s.test(zipPartOr(pptx, drawing)))
+  })
+  // The line has no colour of its own: the shape style's fontRef (lt1) makes it white.
+  err = err ?? await attempt(async () => {
+    await p.waitJS(`const s = [...document.querySelectorAll('.qp-stage [data-sa] span')].find((e) => e.textContent === '全量发布'); return !!s && getComputedStyle(s).color === 'rgb(255, 255, 255)'`, 10000)
+  })
+  s.step('SmartArt：在父节点的形状里改子节点那一行，子节点的数据跟着改，绘图里仍缩进一级；没有自带颜色的文字按形状样式（fontRef）显示为白色', err)
+  await p.shot('web-pptx-smartart.png')
+
+  const slide2 = 'ppt/slides/slide2.xml'
+  const cell = (t) => `[...document.querySelectorAll('.qp-stage td[data-r]')].find((e) => e.textContent === ${jsStr(t)})`
+  err = await attempt(async () => {
+    await p.clickJS(`return __q.centre(document.querySelectorAll('.qp-thumb')[1])`)
+    await p.waitJS(`return !!${cell('王芳')}`, 10000)
+    let at = pt(await p.js(`return __q.centre(${cell('王芳')})`))
+    await p.rclick(at.x, at.y)
+    await p.clickJS(`const b = [...document.querySelectorAll('.q-menu button')].find((b) => b.textContent.trim() === '在下方插入行'); return b && __q.centre(b)`)
+    await waitFile(pptx, slide2, (x) => count(x, '<a:tr ') === 4)
+    await p.waitJS(`return !!${cell('王芳')} && document.querySelectorAll('.qp-stage tr').length === 4`, 10000)
+    at = pt(await p.js(`return __q.centre(${cell('王芳')})`))
+    await p.rclick(at.x, at.y)
+    await p.clickJS(`const b = [...document.querySelectorAll('.q-menu button')].find((b) => b.textContent.trim() === '在右侧插入列'); return b && __q.centre(b)`)
+    await waitFile(pptx, slide2, (x) => count(x, '<a:gridCol ') === 4 && count(x, '<a:tc>') + count(x, '<a:tc ') === 16)
+    await p.waitJS(`return !!${cell('周期')}`, 10000)
+    at = pt(await p.js(`return __q.centre(${cell('周期')})`))
+    await p.rclick(at.x, at.y)
+    await p.clickJS(`const b = [...document.querySelectorAll('.q-menu button')].find((b) => b.textContent.trim() === '删除列'); return b && __q.centre(b)`)
+    await waitFile(pptx, slide2, (x) => count(x, '<a:gridCol ') === 3 && !x.includes('>周期<') && x.includes('>李雷<'))
+  })
+  s.step('表格：右键单元格在下方插入行、在右侧插入列，再删掉「周期」列，行列和网格宽度一起写进文件', err)
+
+  const slide3 = 'ppt/slides/slide3.xml'
+  err = await attempt(async () => {
+    await p.clickJS(`return __q.centre(document.querySelectorAll('.qp-thumb')[2])`)
+    await p.waitJS(`return [...document.querySelectorAll('.qp-stage [data-g] [data-t="txt"], .qp-stage [data-g][data-t="txt"]')].some((e) => e.textContent.includes('第二段'))`, 10000)
+    await editIn(`[...document.querySelectorAll('.qp-stage [data-t="txt"]')].find((e) => e.textContent.includes('第二段'))`, '组合里改过的第二段')()
+    await waitFile(pptx, slide3, (x) => x.includes('>组合里改过的第二段<') && count(x, '<p:grpSp>') === 1 && x.includes('>组合里的第一段<'))
+  })
+  s.step('组合：双击组合里的文本框直接改字，组合保持不变', err)
+  keep(pptx, 'web-流程.pptx')
 }
 
 // ------------------------------------------------------------ large files

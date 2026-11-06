@@ -326,6 +326,117 @@ function paraText (p) {
   return s
 }
 
+// ------------------------------------------------------------- SmartArt
+
+const lname = (n) => n?.name?.replace(/^[\w]+:/, '')
+const lkid = (n, name) => n?.kids?.find((k) => lname(k) === name)
+
+// smartArt reads a SmartArt frame: its data model, the drawing PowerPoint
+// saved for it, and the nodes that hold text (in order, with their depth).
+function smartArt (pkg, part, frame) {
+  const ids = descendants(frame, (n) => lname(n) === 'relIds')[0]
+  const dm = ids && Object.entries(ids.attrs).find(([k]) => k.endsWith(':dm'))?.[1]
+  const dataPart = dm && pkg.rel(part, dm)?.part
+  if (!dataPart || !pkg.has(dataPart)) return undefined
+  const data = pkg.xml(dataPart).root
+  const ext = descendants(data, (n) => lname(n) === 'dataModelExt')[0]
+  const dr = ext?.attrs.relId && pkg.rel(part, ext.attrs.relId)
+  const drawPart = dr?.part && pkg.has(dr.part) ? dr.part : undefined
+  const pts = descendants(lkid(data, 'ptLst'), (n) => lname(n) === 'pt')
+  const byId = new Map(pts.map((x) => [x.attrs.modelId, x]))
+  const parent = new Map(descendants(lkid(data, 'cxnLst'), (n) => lname(n) === 'cxn' && (!n.attrs.type || n.attrs.type === 'parOf')).map((c) => [c.attrs.destId, c.attrs.srcId]))
+  const depth = (id) => { let d = 0; let cur = parent.get(id); while (cur && byId.get(cur) && byId.get(cur).attrs.type !== 'doc' && d < 20) { d++; cur = parent.get(cur) } return d }
+  // The drawing's shapes belong to presentation points, which name the
+  // data node they show.
+  const shown = new Map()
+  for (const x of pts) {
+    const assoc = x.attrs.type === 'pres' && lkid(x, 'prSet')?.attrs.presAssocID
+    if (assoc) shown.set(x.attrs.modelId, assoc)
+  }
+  const drawing = drawPart ? pkg.xml(drawPart).root : undefined
+  const dsps = drawing ? descendants(drawing, (n) => lname(n) === 'sp') : []
+  const nodes = pts.filter((x) => !x.attrs.type || x.attrs.type === 'node' || x.attrs.type === 'asst').map((x) => {
+    const id = x.attrs.modelId
+    return { id, pt: x, lvl: depth(id), text: children(lkid(x, 't'), 'a:p').map(paraText).join('\n'), sps: dsps.filter((d) => (shown.get(d.attrs.modelId) ?? d.attrs.modelId) === id && lkid(d, 'txBody')), hosted: [] }
+  })
+  // Many layouts draw a node's sub-points inside its own shape, as
+  // indented paragraphs after its text: those nodes have a host.
+  const byNode = new Map(nodes.map((n) => [n.id, n]))
+  for (const n of nodes) {
+    if (n.sps.length) continue
+    let cur = parent.get(n.id)
+    for (let d = 0; cur && d < 20 && !byNode.get(cur)?.sps.length; d++) cur = parent.get(cur)
+    const host = cur && byNode.get(cur)
+    if (host?.sps.length) { n.host = host; host.hosted.push(n) }
+  }
+  return { dataPart, drawPart, drawing, nodes }
+}
+
+const lvlOf = (p) => +(child(p, 'a:pPr')?.attrs.lvl ?? 0)
+
+// hostedSpan finds where a hosted node's lines sit in its host's shape:
+// indented paragraphs after the host's own, reading as the node's text.
+function hostedSpan (tb, node) {
+  const ps = children(tb, 'a:p')
+  const lines = node.text.split('\n')
+  for (let i = 0; i + lines.length <= ps.length; i++) {
+    if (!lvlOf(ps[i])) continue
+    if (lines.every((l, j) => paraText(ps[i + j]) === l)) return [i, i + lines.length]
+  }
+  return undefined
+}
+
+// subBody runs write on a txBody that holds only paragraphs [from, to) of
+// tb, puts what it wrote back in their place, and gives the new paragraphs
+// level lvl when lvl is set.
+function subBody (tb, from, to, write, lvl) {
+  const ps = children(tb, 'a:p')
+  const sub = el(tb.name, {}, [...tb.kids.filter((k) => k.name !== 'a:p').map(clone), ...ps.slice(from, to)])
+  write(sub)
+  const neu = children(sub, 'a:p')
+  if (lvl) {
+    for (const p of neu) {
+      let pp = child(p, 'a:pPr')
+      if (!pp) { pp = el('a:pPr'); p.kids.unshift(pp) }
+      pp.attrs.lvl = String(lvl)
+    }
+  }
+  const at = from < ps.length ? tb.kids.indexOf(ps[from]) : tb.kids.length
+  tb.kids = tb.kids.filter((k) => !ps.slice(from, to).includes(k))
+  tb.kids.splice(Math.min(at, tb.kids.length), 0, ...neu)
+}
+
+// setSmartText writes a SmartArt node's text into the data model and the
+// saved drawing, with write(txBody) doing the writing.
+function setSmartText (pkg, sa, node, write) {
+  let t = lkid(node.pt, 't')
+  if (!t) {
+    const p = node.pt.name.includes(':') ? node.pt.name.split(':')[0] + ':' : ''
+    t = el(p + 't', {}, [el('a:bodyPr'), el('a:lstStyle'), el('a:p')])
+    const at = node.pt.kids.findIndex((k) => lname(k) === 'extLst')
+    node.pt.kids.splice(at < 0 ? node.pt.kids.length : at, 0, t)
+  }
+  write(t)
+  pkg.touch(sa.dataPart)
+  let drawn = false
+  for (const d of node.sps) {
+    const tb = lkid(d, 'txBody')
+    // Keep the sub-points the shape draws after the node's own text.
+    const own = node.hosted.length ? children(tb, 'a:p').findIndex((p) => lvlOf(p) > 0) : -1
+    if (own < 0) write(tb)
+    else subBody(tb, 0, own, write)
+    drawn = true
+  }
+  for (const d of node.host?.sps ?? []) {
+    const tb = lkid(d, 'txBody')
+    const span = hostedSpan(tb, node)
+    if (!span) continue
+    subBody(tb, span[0], span[1], write, lvlOf(children(tb, 'a:p')[span[0]]))
+    drawn = true
+  }
+  if (drawn) pkg.touch(sa.drawPart)
+}
+
 // ------------------------------------------------------------- reading
 
 const LIMIT = 16000
@@ -386,6 +497,12 @@ function slideText (deck, s) {
         return
       }
       const uri = descendants(sh, 'a:graphicData')[0]?.attrs.uri ?? ''
+      const sa = /diagram/.test(uri) ? smartArt(pkg, s.part, sh) : undefined
+      if (sa) {
+        lines.push(`${ref} SmartArt "${name}" (set_text takes s${s.n}.${i + 1}.k for node k):`)
+        sa.nodes.forEach((x, k) => lines.push(`${'  '.repeat(x.lvl + 1)}- [s${s.n}.${i + 1}.${k + 1}] ${x.text.replace(/\n/g, ' / ') || '(empty)'}`))
+        return
+      }
       lines.push(`${ref} ${/chart/.test(uri) ? 'chart' : /diagram/.test(uri) ? 'SmartArt' : 'object'} "${name}"`)
       return
     }
@@ -807,12 +924,21 @@ export async function editPptx (buf, edits, io) {
         break
       }
       case 'set_text': {
-        const m = /^\[?s(\d+)\.(\d+)\]?$/.exec(String(e.shape ?? ''))
-        if (!m) throw new Error(`${where}: shape should be a ref like s3.2 from office_read`)
+        const m = /^\[?s(\d+)\.(\d+)(?:\.(\d+))?\]?$/.exec(String(e.shape ?? ''))
+        if (!m) throw new Error(`${where}: shape should be a ref like s3.2 (or s3.2.1 for a SmartArt node) from office_read`)
         const s = byNumber(m[1], where)
         const list = shapes(xpath(pkg.xml(s.part).root, 'p:cSld', 'p:spTree'))
         const sh = list[+m[2] - 1]
         if (!sh) throw new Error(`${where}: slide ${m[1]} has ${list.length} shapes; call office_read for the current refs`)
+        if (m[3] !== undefined) {
+          const sa = sh.name === 'p:graphicFrame' ? smartArt(pkg, s.part, sh) : undefined
+          if (!sa) throw new Error(`${where}: s${m[1]}.${m[2]} is not a SmartArt graphic`)
+          const node = sa.nodes[+m[3] - 1]
+          if (!node) throw new Error(`${where}: that SmartArt has ${sa.nodes.length} nodes; call office_read for the current refs`)
+          setSmartText(pkg, sa, node, (tb) => setParagraphs(tb, e.text ?? ''))
+          report.push(`set text of s${m[1]}.${m[2]}.${m[3]}`)
+          break
+        }
         const tb = child(sh, 'p:txBody')
         if (!tb) throw new Error(`${where}: s${m[1]}.${m[2]} is a ${sh.name === 'p:pic' ? 'picture' : 'table or object'} without its own text; use replace for text in tables`)
         setParagraphs(tb, e.text ?? '')
@@ -1057,12 +1183,44 @@ function renderTree (ctx, tree, part, { decorOnly, group, outer }) {
       const tbl = descendants(node, 'a:tbl')[0]
       if (tbl) { html += `<div class="shp"${ua} style="${style}">${renderTable(ctx, tbl, box)}</div>`; continue }
       const uri = descendants(node, 'a:graphicData')[0]?.attrs.uri ?? ''
+      const sa = /diagram/.test(uri) ? smartArt(ctx.pkg, part, node) : undefined
+      if (sa) { html += renderSmartArt(ctx, sa, part, box, ua, style); continue }
       html += `<div class="shp ph-missing"${ua} style="${style}">${/chart/.test(uri) ? '图表' : /diagram/.test(uri) ? 'SmartArt' : '对象'}</div>`
       continue
     }
     html += renderShape(ctx, node, part, style, ph, ua)
   }
   return html
+}
+
+// renderSmartArt draws a SmartArt graphic from the shapes PowerPoint saved
+// for it (offsets relative to the frame), or, without them, its nodes as
+// a stack of boxes. Each text shape names its node for the editor.
+function renderSmartArt (ctx, sa, part, box, ua, style) {
+  const rename = (n) => { const c = clone(n); const walk = (x) => { if (!isEl(x)) return; if (/^dsp:/.test(x.name)) x.name = 'p:' + x.name.slice(4); x.kids?.forEach(walk) }; walk(c); return c }
+  const owner = new Map()
+  for (const x of sa.nodes) for (const d of x.sps) owner.set(d, x.id)
+  let inner = ''
+  if (sa.drawing) {
+    for (const d of descendants(sa.drawing, (n) => lname(n) === 'sp')) {
+      const sp = rename(d)
+      const b = xfrmOf(sp)
+      if (!b) continue
+      const st = `left:${b.x * ctx.k}px;top:${b.y * ctx.k}px;width:${b.cx * ctx.k}px;height:${b.cy * ctx.k}px;${b.rot ? `transform:rotate(${b.rot}deg);` : ''}`
+      const id = owner.get(d)
+      inner += renderShape(ctx, sp, part, st, undefined, ua && id ? ` data-sa="${escH(id)}"` : '')
+    }
+  } else {
+    const n = Math.max(1, sa.nodes.length)
+    const gap = box.cy * 0.04
+    const h = (box.cy - gap * (n - 1)) / n
+    sa.nodes.forEach((x, i) => {
+      const sp = el('p:sp', {}, [el('p:spPr', {}, [el('a:solidFill', {}, [el('a:schemeClr', { val: 'accent1' })])]), el('p:txBody', {}, [el('a:bodyPr', { anchor: 'ctr' }), ...children(lkid(x.pt, 't'), 'a:p').map((p) => { const c = clone(p); for (const r of children(c, 'a:r')) { let rp = child(r, 'a:rPr'); if (!rp) { rp = el('a:rPr'); r.kids.unshift(rp) } if (!child(rp, 'a:solidFill')) rp.kids.push(el('a:solidFill', {}, [el('a:srgbClr', { val: 'FFFFFF' })])) } return c })])])
+      const st = `left:${x.lvl * box.cx * 0.08 * ctx.k}px;top:${(h + gap) * i * ctx.k}px;width:${box.cx * (1 - x.lvl * 0.08) * ctx.k}px;height:${h * ctx.k}px;`
+      inner += renderShape(ctx, sp, part, st, undefined, ua ? ` data-sa="${escH(x.id)}"` : '')
+    })
+  }
+  return `<div class="shp sa"${ua}${ua ? ' data-sa-frame="1"' : ''} style="${style}">${inner}</div>`
 }
 
 const CLIPS = {
@@ -1175,6 +1333,12 @@ function renderShape (ctx, sp, part, style, ph, ua = '') {
   const ins = (n, d) => (+(bp(n) ?? d)) * ctx.k
   const vert = bp('vert')
   const isTitleType = isTitle(ph?.attrs.type) || ph?.attrs.type === 'subTitle'
+  // A shape's style names its text colour (fontRef, white on PowerPoint's
+  // own shapes and SmartArt); it wins over the inherited text styles but
+  // not over the shape's own list style.
+  const ownLst = child(tb, 'a:lstStyle')
+  const fontRef = xpath(sp, 'p:style', 'a:fontRef')
+  const refColor = fontRef?.kids?.some(isEl) ? ctx.colors.of(fontRef) : undefined
   let inner = ''
   const counters = new Map()
   for (const p of paras) {
@@ -1186,7 +1350,8 @@ function renderShape (ctx, sp, part, style, ph, ua = '') {
     const indent = +(prop((l) => l.attrs.indent) ?? 0) * ctx.k
     const defSz = prop((l) => child(l, 'a:defRPr')?.attrs.sz)
     const defB = prop((l) => child(l, 'a:defRPr')?.attrs.b)
-    const defColor = prop((l) => { const f = child(child(l, 'a:defRPr'), 'a:solidFill'); return f ? ctx.colors.of(f) : undefined })
+    const colorOf = (l) => { const f = child(child(l, 'a:defRPr'), 'a:solidFill'); return f ? ctx.colors.of(f) : undefined }
+    const defColor = (ppr && colorOf(ppr)) ?? lvlProp([ownLst], lv, colorOf) ?? refColor ?? prop(colorOf)
     const buNone = prop((l) => (child(l, 'a:buNone') ? true : (child(l, 'a:buChar') || child(l, 'a:buAutoNum')) ? false : undefined))
     const buChar = prop((l) => child(l, 'a:buChar')?.attrs.char)
     const buAuto = prop((l) => child(l, 'a:buAutoNum')?.attrs.type)
@@ -1391,6 +1556,12 @@ function enforceA (rpr, want) {
 function writeShapeText (sp, paras) {
   let tb = child(sp, 'p:txBody')
   if (!tb) { tb = el('p:txBody', {}, [el('a:bodyPr'), el('a:lstStyle')]); sp.kids.push(tb) }
+  writeBody(tb, paras, !phOf(sp))
+}
+
+// writeBody puts edited paragraphs into a text body, each new run taking
+// the formatting of the old text it replaces.
+function writeBody (tb, paras, ownBullets) {
   const oldPs = children(tb, 'a:p')
   const owners = []
   let old = ''
@@ -1419,7 +1590,7 @@ function writeShapeText (sp, paras) {
     const pp = ppr ? clone(ppr) : el('a:pPr')
     if (p.algn !== undefined) { if (p.algn) pp.attrs.algn = p.algn; else delete pp.attrs.algn }
     if (p.lvl !== undefined) { if (+p.lvl) pp.attrs.lvl = String(p.lvl); else delete pp.attrs.lvl }
-    if (p.bu !== undefined) setBullet(pp, p.bu, !phOf(sp))
+    if (p.bu !== undefined) setBullet(pp, p.bu, ownBullets)
     if (p.ls !== undefined) { pp.kids = pp.kids.filter((x) => x.name !== 'a:lnSpc'); if (+p.ls) insertOrdered(pp, el('a:lnSpc', {}, [el('a:spcPct', { val: String(Math.round(+p.ls * 1000)) })]), PPR_KIDS) }
     if (Object.keys(pp.attrs).length || pp.kids.length) kids.push(pp)
     const end = src && child(src, 'a:endParaRPr')
@@ -1452,6 +1623,97 @@ const darker = (h) => h.match(/../g).map((x) => Math.round(parseInt(x, 16) * 0.7
 
 // writeCellText puts plain lines in a table cell, keeping the formatting
 // of its first run.
+// tableLines inserts a blank row or column before line at (1-based;
+// count > 0) or deletes the line at (count < 0); merges that span the
+// line grow or shrink, and the frame keeps its other lines' sizes.
+function tableLines (frame, tbl, axis, at, count, where) {
+  const rows = children(tbl, 'a:tr')
+  const grid = child(tbl, 'a:tblGrid')
+  const cols = children(grid, 'a:gridCol')
+  const ext = xpath(frame, 'p:xfrm', 'a:ext')
+  const blank = (tc) => { for (const k of ['rowSpan', 'gridSpan', 'hMerge', 'vMerge']) delete tc.attrs[k]; writeCellText(tc, ''); return tc }
+  if (axis === 'r') {
+    if (count > 0) {
+      const ref = rows[Math.min(at, rows.length) - 1] ?? rows[0]
+      if (!ref) throw new Error(`${where}: the table has no rows`)
+      const row = clone(ref)
+      const tcs = children(row, 'a:tc')
+      tcs.forEach((tc, j) => {
+        blank(tc)
+        // A vertical merge running through the new row takes it in.
+        if (at > 1 && at <= rows.length) {
+          for (let i = at - 2; i >= 0; i--) {
+            const up = children(rows[i], 'a:tc')[j]
+            if (!up) break
+            if (up.attrs.vMerge) continue
+            if (+(up.attrs.rowSpan ?? 1) > at - 1 - i) { up.attrs.rowSpan = String(+up.attrs.rowSpan + 1); tc.attrs.vMerge = '1' }
+            break
+          }
+        }
+      })
+      tbl.kids.splice(at <= rows.length ? tbl.kids.indexOf(rows[at - 1]) : tbl.kids.indexOf(rows[rows.length - 1]) + 1, 0, row)
+      if (ext) ext.attrs.cy = String(+ext.attrs.cy + +(row.attrs.h ?? 0))
+    } else {
+      const row = rows[at - 1]
+      if (!row) throw new Error(`${where}: there is no row ${at}`)
+      if (rows.length < 2) throw new Error(`${where}: a table keeps at least one row`)
+      children(row, 'a:tc').forEach((tc, j) => {
+        const span = +(tc.attrs.rowSpan ?? 1)
+        if (span > 1 && rows[at]) { const down = children(rows[at], 'a:tc')[j]; if (down) { delete down.attrs.vMerge; if (span > 2) down.attrs.rowSpan = String(span - 1); const tb = child(tc, 'a:txBody'); const dtb = child(down, 'a:txBody'); if (tb && dtb) down.kids.splice(down.kids.indexOf(dtb), 1, tb) } }
+        if (tc.attrs.vMerge) {
+          for (let i = at - 2; i >= 0; i--) {
+            const up = children(rows[i], 'a:tc')[j]
+            if (up && !up.attrs.vMerge) { const n = +(up.attrs.rowSpan ?? 1) - 1; if (n > 1) up.attrs.rowSpan = String(n); else delete up.attrs.rowSpan; break }
+          }
+        }
+      })
+      remove(tbl, row)
+      if (ext) ext.attrs.cy = String(Math.max(0, +ext.attrs.cy - +(row.attrs.h ?? 0)))
+    }
+    return
+  }
+  if (count > 0) {
+    const j = Math.min(at, cols.length) - 1
+    const gc = clone(cols[j] ?? cols[0])
+    grid.kids.splice(at <= cols.length ? grid.kids.indexOf(cols[at - 1]) : grid.kids.indexOf(cols[cols.length - 1]) + 1, 0, gc)
+    for (const tr of rows) {
+      const tcs = children(tr, 'a:tc')
+      const tc = blank(clone(tcs[j] ?? tcs[0]))
+      if (at > 1 && at <= tcs.length) {
+        for (let i = at - 2; i >= 0; i--) {
+          const left = tcs[i]
+          if (left.attrs.hMerge) continue
+          if (+(left.attrs.gridSpan ?? 1) > at - 1 - i) { left.attrs.gridSpan = String(+left.attrs.gridSpan + 1); tc.attrs.hMerge = '1' }
+          break
+        }
+        if (tcs[at - 1].attrs.vMerge && tc.attrs.hMerge === undefined) tc.attrs.vMerge = tcs[at - 1].attrs.vMerge
+      }
+      tr.kids.splice(at <= tcs.length ? tr.kids.indexOf(tcs[at - 1]) : tr.kids.indexOf(tcs[tcs.length - 1]) + 1, 0, tc)
+    }
+    if (ext) ext.attrs.cx = String(+ext.attrs.cx + +(gc.attrs.w ?? 0))
+  } else {
+    const gc = cols[at - 1]
+    if (!gc) throw new Error(`${where}: there is no column ${at}`)
+    if (cols.length < 2) throw new Error(`${where}: a table keeps at least one column`)
+    for (const tr of rows) {
+      const tcs = children(tr, 'a:tc')
+      const tc = tcs[at - 1]
+      if (!tc) continue
+      const span = +(tc.attrs.gridSpan ?? 1)
+      if (span > 1 && tcs[at]) { const right = tcs[at]; delete right.attrs.hMerge; if (span > 2) right.attrs.gridSpan = String(span - 1); const tb = child(tc, 'a:txBody'); const rtb = child(right, 'a:txBody'); if (tb && rtb) right.kids.splice(right.kids.indexOf(rtb), 1, tb) }
+      if (tc.attrs.hMerge) {
+        for (let i = at - 2; i >= 0; i--) {
+          const left = tcs[i]
+          if (!left.attrs.hMerge) { const n = +(left.attrs.gridSpan ?? 1) - 1; if (n > 1) left.attrs.gridSpan = String(n); else delete left.attrs.gridSpan; break }
+        }
+      }
+      remove(tr, tc)
+    }
+    remove(grid, gc)
+    if (ext) ext.attrs.cx = String(Math.max(0, +ext.attrs.cx - +(gc.attrs.w ?? 0)))
+  }
+}
+
 function writeCellText (tc, value) {
   let tb = child(tc, 'a:txBody')
   if (!tb) { tb = el('a:txBody', {}, [el('a:bodyPr'), el('a:lstStyle')]); tc.kids.unshift(tb) }
@@ -1550,13 +1812,37 @@ function transitionOf (root) {
   return out
 }
 
-const ANIM_PRESETS = { 1: 'appear', 2: 'fly', 10: 'fade', 22: 'wipe', 23: 'zoom', 53: 'zoom' }
-const ANIM_IDS = { appear: 1, fly: 2, fade: 10, wipe: 22, zoom: 23 }
+// Effects by class: entrance and exit share their presets; emphasis has
+// its own; a motion path is a straight line up, down, left or right.
+const ANIM_PRESETS = {
+  entr: { 1: 'appear', 2: 'fly', 10: 'fade', 22: 'wipe', 23: 'zoom', 53: 'zoom' },
+  exit: { 1: 'appear', 2: 'fly', 10: 'fade', 22: 'wipe', 23: 'zoom', 53: 'zoom' },
+  emph: { 6: 'grow', 8: 'spin', 9: 'transparency', 26: 'pulse' }
+}
+const ANIM_IDS = {
+  entr: { appear: 1, fly: 2, fade: 10, wipe: 22, zoom: 23 },
+  exit: { appear: 1, fly: 2, fade: 10, wipe: 22, zoom: 23 },
+  emph: { grow: 6, spin: 8, transparency: 9, pulse: 26 },
+  path: { line: 0 }
+}
 const DIR_SUB = { t: 1, r: 2, b: 4, l: 8 }
 const SUB_DIR = { 1: 't', 2: 'r', 4: 'b', 8: 'l' }
+const PATH_STEP = 0.25 // of the slide, for a line path
 
-// animationsOf lists the entrance effects of a slide's main sequence in
-// order. locked says the slide holds effects the editor cannot rewrite.
+// linePath reads a motion path that is one straight move, as a direction.
+function linePath (tn) {
+  const mo = descendants(tn, 'p:animMotion')
+  if (mo.length !== 1) return undefined
+  const m = /^\s*M\s+0\s+0\s+L\s+(-?[\d.]+(?:E-?\d+)?)\s+(-?[\d.]+(?:E-?\d+)?)\s*E?\s*$/i.exec(mo[0].attrs.path ?? '')
+  if (!m) return undefined
+  const x = +m[1]; const y = +m[2]
+  if (Math.abs(x) > Math.abs(y) * 10 && x) return x > 0 ? 'r' : 'l'
+  if (Math.abs(y) > Math.abs(x) * 10 && y) return y > 0 ? 'b' : 't'
+  return undefined
+}
+
+// animationsOf lists the effects of a slide's main sequence in order.
+// locked says the slide holds effects the editor cannot rewrite.
 function animationsOf (root) {
   const timing = child(root, 'p:timing')
   if (!timing) return { list: [] }
@@ -1565,16 +1851,21 @@ function animationsOf (root) {
   for (const tn of descendants(timing, 'p:cTn')) {
     const cls = tn.attrs.presetClass
     if (!cls) continue
-    if (cls !== 'entr' || !ANIM_PRESETS[tn.attrs.presetID]) { locked = true; continue }
+    const path = cls === 'path' ? linePath(tn) : undefined
+    const effect = cls === 'path' ? (path ? 'line' : undefined) : ANIM_PRESETS[cls]?.[tn.attrs.presetID]
+    if (!effect) { locked = true; continue }
     const spid = descendants(tn, 'p:spTgt')[0]?.attrs.spid
     if (!spid) { locked = true; continue }
-    const timed = descendants(tn, 'p:cTn').find((c) => c !== tn && +c.attrs.dur > 1)
+    const timed = descendants(tn, 'p:cTn').filter((c) => c !== tn && +c.attrs.dur > 1)
+    const dur = timed.length ? Math.max(...timed.map((c) => +c.attrs.dur * (c.attrs.autoRev === '1' ? 2 : 1))) : 500
+    const dir = cls === 'path' ? path : SUB_DIR[tn.attrs.presetSubtype]
     list.push({
       spid,
-      effect: ANIM_PRESETS[tn.attrs.presetID],
+      ...(cls !== 'entr' ? { cls } : {}),
+      effect,
       start: tn.attrs.nodeType === 'withEffect' ? 'with' : tn.attrs.nodeType === 'afterEffect' ? 'after' : 'click',
-      dur: timed ? +timed.attrs.dur : 500,
-      ...(SUB_DIR[tn.attrs.presetSubtype] ? { dir: SUB_DIR[tn.attrs.presetSubtype] } : {})
+      dur,
+      ...(dir && (cls === 'path' || ['fly', 'wipe'].includes(effect)) ? { dir } : {})
     })
   }
   if (descendants(timing, 'p:seq').some((s) => xpath(s, 'p:cTn')?.attrs.nodeType === 'interactiveSeq')) locked = true
@@ -1606,36 +1897,57 @@ function setTransition (root, t) {
 
 function setAnimations (root, list, spids, where) {
   const cur = animationsOf(root)
-  if (cur.locked) throw new Error(`${where}: 这张幻灯片含有强调、退出、路径或触发器动画，请在 PowerPoint 中编辑`)
+  if (cur.locked) throw new Error(`${where}: 这张幻灯片含有触发器或本编辑器不认识的动画，请在 PowerPoint 中编辑`)
   root.kids = root.kids.filter((k) => k.name !== 'p:timing')
   if (!list.length) return
   let id = 1
   const cTn = (attrs, kids) => el('p:cTn', { id: String(id++), ...attrs }, kids)
   const cond = (delay) => el('p:stCondLst', {}, [el('p:cond', { delay: String(delay) })])
   const tgt = (spid) => el('p:tgtEl', {}, [el('p:spTgt', { spid })])
-  const set = (spid) => el('p:set', {}, [el('p:cBhvr', {}, [cTn({ dur: '1', fill: 'hold' }, [cond(0)]), tgt(spid), el('p:attrNameLst', {}, [el('p:attrName', {}, [text('style.visibility')])])]), el('p:to', {}, [el('p:strVal', { val: 'visible' })])])
+  const set = (spid, val = 'visible', delay = 0) => el('p:set', {}, [el('p:cBhvr', {}, [cTn({ dur: '1', fill: 'hold' }, [cond(delay)]), tgt(spid), el('p:attrNameLst', {}, [el('p:attrName', {}, [text('style.visibility')])])]), el('p:to', {}, [el('p:strVal', { val })])])
   const anim = (spid, dur, attr, from, to) => el('p:anim', { calcmode: 'lin', valueType: 'num' }, [
     el('p:cBhvr', { additive: 'base' }, [cTn({ dur: String(dur), fill: 'hold' }), tgt(spid), el('p:attrNameLst', {}, [el('p:attrName', {}, [text(attr)])])]),
     el('p:tavLst', {}, [el('p:tav', { tm: '0' }, [el('p:val', {}, [el('p:strVal', { val: from })])]), el('p:tav', { tm: '100000' }, [el('p:val', {}, [el('p:strVal', { val: to })])])])
   ])
-  const effect = (spid, filter, dur) => el('p:animEffect', { transition: 'in', filter }, [el('p:cBhvr', {}, [cTn({ dur: String(dur) }), tgt(spid)])])
+  const effect = (spid, filter, dur, how = 'in') => el('p:animEffect', { transition: how, filter }, [el('p:cBhvr', {}, [cTn({ dur: String(dur) }), tgt(spid)])])
+  const bhvr = (spid, attrs, names) => el('p:cBhvr', {}, [cTn({ fill: 'hold', ...attrs }), tgt(spid), ...(names ? [el('p:attrNameLst', {}, names.map((x) => el('p:attrName', {}, [text(x)])))] : [])])
   const behaviours = (a) => {
     const d = Math.max(100, Math.min(20000, Math.round(+a.dur || 500)))
+    const cls = a.cls ?? 'entr'
+    const dir = a.dir ?? 'b'
+    const off = { x: dir === 'l' ? '0-#ppt_w/2' : dir === 'r' ? '1+#ppt_w/2' : '#ppt_x', y: dir === 't' ? '0-#ppt_h/2' : dir === 'b' ? '1+#ppt_h/2' : '#ppt_y' }
+    if (cls === 'emph') {
+      if (a.effect === 'pulse') return { d, kids: [el('p:animScale', {}, [bhvr(a.spid, { dur: String(Math.round(d / 2)), autoRev: '1' }), el('p:by', { x: '105000', y: '105000' })])] }
+      if (a.effect === 'grow') return { d, kids: [el('p:animScale', {}, [bhvr(a.spid, { dur: String(d) }), el('p:by', { x: '150000', y: '150000' })])] }
+      if (a.effect === 'spin') return { d, kids: [el('p:animRot', { by: '21600000' }, [bhvr(a.spid, { dur: String(d) }, ['r'])])] }
+      return { d, kids: [el('p:set', {}, [bhvr(a.spid, { dur: String(d) }, ['style.opacity']), el('p:to', { }, [el('p:strVal', { val: '0.5' })])]), el('p:animEffect', { filter: 'image', prLst: 'opacity: 0.5' }, [el('p:cBhvr', { rctx: 'IE' }, [cTn({ dur: String(d), fill: 'hold' }), tgt(a.spid)])])] }
+    }
+    if (cls === 'path') {
+      const v = { b: [0, PATH_STEP], t: [0, -PATH_STEP], r: [PATH_STEP, 0], l: [-PATH_STEP, 0] }[dir] ?? [0, PATH_STEP]
+      return { d, kids: [el('p:animMotion', { origin: 'layout', path: `M 0 0 L ${v[0]} ${v[1]} E`, pathEditMode: 'relative', ptsTypes: 'AA' }, [bhvr(a.spid, { dur: String(d) }, ['ppt_x', 'ppt_y'])])] }
+    }
+    if (cls === 'exit') {
+      const out = []
+      if (a.effect === 'fade') out.push(effect(a.spid, 'fade', d, 'out'))
+      if (a.effect === 'wipe') out.push(effect(a.spid, `wipe(${{ b: 'down', t: 'up', l: 'left', r: 'right' }[dir]})`, d, 'out'))
+      if (a.effect === 'fly') { out.push(anim(a.spid, d, 'ppt_x', '#ppt_x', off.x)); out.push(anim(a.spid, d, 'ppt_y', '#ppt_y', off.y)) }
+      if (a.effect === 'zoom') { out.push(anim(a.spid, d, 'ppt_w', '#ppt_w', '0')); out.push(anim(a.spid, d, 'ppt_h', '#ppt_h', '0')) }
+      out.push(set(a.spid, 'hidden', a.effect === 'appear' ? 0 : d - 1))
+      return { d, kids: out }
+    }
     const out = [set(a.spid)]
     if (a.effect === 'fade') out.push(effect(a.spid, 'fade', d))
-    if (a.effect === 'wipe') out.push(effect(a.spid, `wipe(${{ b: 'up', t: 'down', l: 'right', r: 'left' }[a.dir ?? 'b']})`, d))
-    if (a.effect === 'fly') {
-      const dir = a.dir ?? 'b'
-      out.push(anim(a.spid, d, 'ppt_x', dir === 'l' ? '0-#ppt_w/2' : dir === 'r' ? '1+#ppt_w/2' : '#ppt_x', '#ppt_x'))
-      out.push(anim(a.spid, d, 'ppt_y', dir === 't' ? '0-#ppt_h/2' : dir === 'b' ? '1+#ppt_h/2' : '#ppt_y', '#ppt_y'))
-    }
+    if (a.effect === 'wipe') out.push(effect(a.spid, `wipe(${{ b: 'up', t: 'down', l: 'right', r: 'left' }[dir]})`, d))
+    if (a.effect === 'fly') { out.push(anim(a.spid, d, 'ppt_x', off.x, '#ppt_x')); out.push(anim(a.spid, d, 'ppt_y', off.y, '#ppt_y')) }
     if (a.effect === 'zoom') { out.push(anim(a.spid, d, 'ppt_w', '0', '#ppt_w')); out.push(anim(a.spid, d, 'ppt_h', '0', '#ppt_h')) }
     return { d, kids: out }
   }
   // Click groups hold steps; a step holds effects that start together.
   const groups = []
   for (const a of list) {
-    if (!ANIM_IDS[a.effect]) throw new Error(`${where}: effect "${a.effect}" is not one of appear, fade, fly, wipe, zoom`)
+    const cls = a.cls ?? 'entr'
+    if (!ANIM_IDS[cls]) throw new Error(`${where}: cls "${cls}" is not one of entr, emph, exit, path`)
+    if (ANIM_IDS[cls][a.effect] === undefined) throw new Error(`${where}: a ${cls} effect is one of ${Object.keys(ANIM_IDS[cls]).join(', ')}, not "${a.effect}"`)
     if (!spids.has(String(a.spid))) throw new Error(`${where}: the slide has no shape with id ${a.spid}`)
     if (a.start === 'click' || !groups.length) groups.push({ steps: [{ at: 0, items: [] }], end: 0 })
     const g = groups[groups.length - 1]
@@ -1648,9 +1960,10 @@ function setAnimations (root, list, spids, where) {
     const first = list.indexOf(g.steps[0].items[0])
     const auto = gi === 0 && list[first].start !== 'click'
     return el('p:par', {}, [cTn({ fill: 'hold' }, [cond(auto ? 0 : 'indefinite'), el('p:childTnLst', {}, g.steps.map((st) => el('p:par', {}, [cTn({ fill: 'hold' }, [cond(st.at), el('p:childTnLst', {}, st.items.map((a) => {
-      const sub = a.effect === 'fly' || a.effect === 'wipe' ? DIR_SUB[a.dir ?? 'b'] : a.effect === 'zoom' ? 16 : 0
+      const cls = a.cls ?? 'entr'
+      const sub = cls === 'emph' || cls === 'path' ? 0 : a.effect === 'fly' || a.effect === 'wipe' ? DIR_SUB[a.dir ?? 'b'] : a.effect === 'zoom' ? 16 : 0
       const node = el('p:par', {}, [])
-      const c = cTn({ presetID: String(ANIM_IDS[a.effect]), presetClass: 'entr', presetSubtype: String(sub), fill: 'hold', grpId: '0', nodeType: a.start === 'with' ? 'withEffect' : a.start === 'after' ? 'afterEffect' : 'clickEffect' }, [cond(0)])
+      const c = cTn({ presetID: String(ANIM_IDS[cls][a.effect]), presetClass: cls, presetSubtype: String(sub), ...(cls === 'path' ? { accel: '50000', decel: '50000' } : {}), fill: 'hold', grpId: '0', nodeType: a.start === 'with' ? 'withEffect' : a.start === 'after' ? 'afterEffect' : 'clickEffect' }, [cond(0)])
       c.kids.push(el('p:childTnLst', {}, behaviours(a).kids))
       node.kids.push(c)
       return node
@@ -2147,6 +2460,43 @@ export async function editPptxUi (buf, ops, io) {
         if (!tc) throw new Error(`${where}: shape ${e.shape} has no table cell at row ${e.row}, column ${e.col}`)
         writeCellText(tc, String(e.text ?? ''))
         pkg.touch(s.part)
+        break
+      }
+      case 'table_lines': {
+        const { s, node } = shapeOf(deck, e, where)
+        const tbl = descendants(node, 'a:tbl')[0]
+        if (!tbl) throw new Error(`${where}: shape ${e.shape} is not a table`)
+        tableLines(node, tbl, e.axis === 'c' ? 'c' : 'r', Math.max(1, +e.at || 1), +e.count > 0 ? 1 : -1, where)
+        pkg.touch(s.part)
+        break
+      }
+      case 'smart_text': {
+        const { s, node } = shapeOf(deck, e, where)
+        const sa = node.name === 'p:graphicFrame' ? smartArt(pkg, s.part, node) : undefined
+        const x = sa?.nodes.find((n) => n.id === String(e.node))
+        if (!x) throw new Error(`${where}: that SmartArt node is gone; reload the presentation`)
+        const paras = Array.isArray(e.paras) ? e.paras : []
+        if (!x.hosted.length) {
+          setSmartText(pkg, sa, x, (tb) => writeBody(tb, paras, true))
+          break
+        }
+        // The shape shows the node and its sub-points: the leading
+        // paragraphs are the node's, each indented one a sub-point's (the
+        // last takes any extra lines).
+        let own = paras.findIndex((p) => +p.lvl > 0)
+        if (own < 0) own = paras.length
+        const flat = (ps) => ps.map((p) => ({ ...p, lvl: 0 }))
+        const writeData = (n, ps) => {
+          let t = lkid(n.pt, 't')
+          if (!t) { setSmartText(pkg, sa, { ...n, sps: [], host: undefined, hosted: [] }, (tb) => writeBody(tb, flat(ps), true)); return }
+          writeBody(t, ps.length ? flat(ps) : [{ runs: [] }], true)
+        }
+        writeData(x, paras.slice(0, own))
+        const rest = paras.slice(own)
+        x.hosted.forEach((n, i) => writeData(n, i === x.hosted.length - 1 ? rest.slice(i) : rest.slice(i, i + 1)))
+        for (const d of x.sps) writeBody(lkid(d, 'txBody'), paras, true)
+        pkg.touch(sa.dataPart)
+        pkg.touch(sa.drawPart)
         break
       }
       case 'shape_style': {

@@ -423,12 +423,13 @@ class Writer {
       for (let c = 0; c < cols; c++) {
         // The header row is bold and shaded directly too, for renderers
         // that ignore table styles.
-        const runs = await this.runs(b.rows[r][c] ?? [], r === 0 ? [el('w:b'), el('w:bCs')] : [])
+        const head = r === 0 && b.header !== false
+        const runs = await this.runs(b.rows[r][c] ?? [], head ? [el('w:b'), el('w:bCs')] : [])
         const p = this.para(null, runs, b.align?.[c] && b.align[c] !== 'left' ? b.align[c] : undefined)
-        const tcPr = el('w:tcPr', {}, [el('w:tcW', { 'w:w': String(width), 'w:type': 'dxa' }), r === 0 ? el('w:shd', { 'w:val': 'clear', 'w:color': 'auto', 'w:fill': 'D9E2F3' }) : null])
+        const tcPr = el('w:tcPr', {}, [el('w:tcW', { 'w:w': String(width), 'w:type': 'dxa' }), head ? el('w:shd', { 'w:val': 'clear', 'w:color': 'auto', 'w:fill': 'D9E2F3' }) : null])
         cells.push(el('w:tc', {}, [tcPr, p]))
       }
-      rows.push(el('w:tr', {}, [r === 0 ? el('w:trPr', {}, [el('w:tblHeader')]) : null, ...cells]))
+      rows.push(el('w:tr', {}, [r === 0 && b.header !== false ? el('w:trPr', {}, [el('w:tblHeader')]) : null, ...cells]))
     }
     return el('w:tbl', {}, [
       el('w:tblPr', {}, [v('w:tblStyle', this.styles.table), el('w:tblW', { 'w:w': '5000', 'w:type': 'pct' }),
@@ -705,7 +706,8 @@ export function readDocx (buf, { from = 1 } = {}) {
   const extras = []
   if (headers || footers) extras.push(`${headers} headers, ${footers} footers (edit their text with docx_edit replace)`)
   if (nComments) extras.push(`${nComments} comments`)
-  if (tracked) extras.push(`${tracked} tracked changes (shown as accepted)`)
+  if (tracked) extras.push(`${tracked} tracked changes (the text shows them accepted)`)
+  if (trackOn(m)) extras.push('track changes is on')
   if (extras.length) head += '; ' + extras.join('; ')
   head += '.\nRefs [p…] and [t…] name blocks for docx_edit.\n'
   const lines = []
@@ -723,6 +725,38 @@ export function readDocx (buf, { from = 1 } = {}) {
   if (start > 1) out += `(starting at block ${start} of ${m.blocks.length})\n`
   out += '\n' + (lines.length ? lines.join('\n') : '(the document has no text)')
   if (next) out += `\n\n[the document goes on: call office_read with from: ${next} for the next part]`
+  if (start === 1) out += reviewNotes(m)
+  return out
+}
+
+// reviewNotes lists comments (threads under their first comment) and
+// tracked changes, by the ids docx_edit takes, with the block each is in.
+function reviewNotes (m) {
+  const where = new Map()
+  for (const b of m.blocks) for (const n of descendants(b.node, (x) => CM_NAMES.has(x.name) || REV_NAMES.has(x.name))) if (!where.has(n)) where.set(n, b.ref)
+  const blockOf = (pred) => { for (const [n, ref] of where) if (pred(n)) return ref }
+  const one = (s, n = 80) => { s = String(s).replace(/\s+/g, ' ').trim(); return s.length > n ? s.slice(0, n) + '…' : s }
+  let out = ''
+  const list = readComments(m)
+  if (list.length) {
+    const rows = []
+    const line = (c, pad) => rows.push(`${pad}- comment ${c.id} by ${c.author || '?'}${c.done ? ' (resolved)' : ''}: ${one(c.text)}`)
+    for (const c of list.filter((x) => !x.parent).slice(0, 60)) {
+      const ref = blockOf((n) => CM_NAMES.has(n.name) && n.attrs['w:id'] === c.id)
+      rows.push(`- comment ${c.id} by ${c.author || '?'}${c.done ? ' (resolved)' : ''}${ref ? ` on ${ref}` : ''}${c.quote ? ` "${one(c.quote, 40)}"` : ''}: ${one(c.text)}`)
+      for (const r of list.filter((x) => x.parent === c.id)) line(r, '  ')
+    }
+    out += '\n\nComments (docx_edit reply, resolve or delete_comment take the number):\n' + rows.join('\n')
+  }
+  const revs = []
+  for (const n of descendants(m.body, (x) => REV_NAMES.has(x.name))) {
+    if (parentOf(m.body, n)?.name === 'w:rPr') continue
+    const kind = { 'w:ins': 'inserted', 'w:moveTo': 'moved here', 'w:del': 'deleted', 'w:moveFrom': 'moved away', 'w:rPrChange': 'formatted', 'w:pPrChange': 'paragraph formatted' }[n.name]
+    const t = n.name.endsWith('Change') ? '' : descendants(n, (x) => x.name === 'w:t' || x.name === 'w:delText').map(textContent).join('')
+    revs.push(`- change ${n.attrs['w:id']}: ${kind} by ${n.attrs['w:author'] || '?'}${where.get(n) ? ` in ${where.get(n)}` : ''}${t ? ` "${one(t, 60)}"` : ''}`)
+    if (revs.length >= 80) { revs.push('- …'); break }
+  }
+  if (revs.length) out += '\n\nTracked changes (docx_edit accept or reject take the number, or a block, or neither for all):\n' + revs.join('\n')
   return out
 }
 
@@ -832,8 +866,45 @@ export async function editDocx (buf, edits, io) {
         report.push(`set ${b.ref} row ${e.row} col ${e.col}`)
         break
       }
+      case 'comment': {
+        const b = block(e.block, op)
+        if (!String(e.text ?? '').trim()) throw new Error(`${where}: text is required`)
+        const p = b.kind === 'p' ? b.node : descendants(b.node, 'w:p').find((x) => !e.find || liveText(x).includes(e.find))
+        if (!p) throw new Error(`${where}: "${e.find}" is not in ${b.ref}`)
+        const { id } = addComment(m, { text: e.text, author: e.author || 'Agent' })
+        anchorComment(p, e.find ? String(e.find) : '', id, where)
+        report.push(`added comment ${id} on ${b.ref}`)
+        break
+      }
+      case 'reply': {
+        replyComment(m, { parent: String(e.comment), text: e.text, author: e.author || 'Agent' }, where)
+        report.push(`replied to comment ${e.comment}`)
+        break
+      }
+      case 'resolve': {
+        doneComment(m, { id: String(e.comment), done: e.done !== false }, where)
+        report.push(`${e.done === false ? 'reopened' : 'resolved'} comment ${e.comment}`)
+        break
+      }
+      case 'delete_comment': {
+        deleteComments(m, [String(e.comment)], where)
+        report.push(`deleted comment ${e.comment} with its replies`)
+        break
+      }
+      case 'accept': case 'reject': {
+        const id = e.id !== undefined ? String(e.id) : undefined
+        if (id !== undefined && !descendants(m.body, (x) => REV_NAMES.has(x.name) && x.attrs['w:id'] === id).length) throw new Error(`${where}: there is no tracked change ${id}; call office_read for the current ones`)
+        resolveRevisions(m, e.block ? block(e.block, op).node : m.body, op, id)
+        report.push(`${op}ed ${id !== undefined ? `change ${id}` : e.block ? `the changes in ${e.block}` : 'every change'}`)
+        break
+      }
+      case 'track': {
+        setTrack(m, e.on !== false)
+        report.push(`track changes ${e.on !== false ? 'on' : 'off'}`)
+        break
+      }
       default:
-        throw new Error(`${where}: unknown op; use replace, insert, append, set, delete or cell`)
+        throw new Error(`${where}: unknown op; use replace, insert, append, set, delete, cell, comment, reply, resolve, delete_comment, accept, reject or track`)
     }
   }
   // Word wants a paragraph right before sectPr when the body ends with a table.
@@ -846,6 +917,75 @@ export async function editDocx (buf, edits, io) {
   }
   pkg.touch(m.main)
   return { buffer: pkg.toBuffer(), summary: report.join('; ') }
+}
+
+const REV_NAMES = new Set(['w:ins', 'w:del', 'w:moveFrom', 'w:moveTo', 'w:rPrChange', 'w:pPrChange'])
+
+// liveTs lists a paragraph's w:t elements outside deletions, in order.
+function liveTs (p) {
+  const ts = []
+  const visit = (n) => {
+    for (const k of n.kids) {
+      if (!isEl(k) || k.name === 'w:del' || k.name === 'w:moveFrom' || k.name === 'w:p' || k.name === 'w:pPr') continue
+      if (k.name === 'w:t') ts.push(k)
+      else if (k.name !== 'w:instrText') visit(k)
+    }
+  }
+  visit(p)
+  return ts
+}
+const liveText = (p) => liveTs(p).map(textContent).join('')
+
+// splitRunAt makes the text at offset in p start a run of its own and
+// returns that run (undefined at the end of the text).
+function splitRunAt (p, offset) {
+  let pos = 0
+  for (const t of liveTs(p)) {
+    const s = textContent(t)
+    if (offset >= pos + s.length) { pos += s.length; continue }
+    const o = offset - pos
+    const r = parentOf(p, t)
+    const at = r.kids.indexOf(t)
+    const before = r.kids.slice(0, at).filter((k) => isEl(k) && k.name !== 'w:rPr')
+    if (o === 0 && !before.length) return r
+    const rpr = child(r, 'w:rPr')
+    let rest
+    if (o === 0) rest = r.kids.slice(at)
+    else {
+      t.kids = [text(s.slice(0, o))]
+      t.attrs['xml:space'] = 'preserve'
+      rest = [el('w:t', { 'xml:space': 'preserve' }, [text(s.slice(o))]), ...r.kids.slice(at + 1)]
+    }
+    r.kids = r.kids.slice(0, o === 0 ? at : at + 1)
+    const r2 = el('w:r', { ...r.attrs }, [rpr ? clone(rpr) : null, ...rest])
+    const owner = parentOf(p, r)
+    owner.kids.splice(owner.kids.indexOf(r) + 1, 0, r2)
+    return r2
+  }
+  return undefined
+}
+
+// anchorComment marks the comment's range: the text find within the
+// paragraph (it must occur once), or the whole paragraph.
+function anchorComment (p, find, id, where) {
+  const start = el('w:commentRangeStart', { 'w:id': id })
+  const end = el('w:commentRangeEnd', { 'w:id': id })
+  const ref = el('w:r', {}, [el('w:rPr', {}, [el('w:rStyle', { 'w:val': 'CommentReference' })]), el('w:commentReference', { 'w:id': id })])
+  if (!find) {
+    const ppr = child(p, 'w:pPr')
+    p.kids.splice(ppr ? p.kids.indexOf(ppr) + 1 : 0, 0, start)
+    p.kids.push(end, ref)
+    return
+  }
+  const all = liveText(p)
+  const i = all.indexOf(find)
+  if (i < 0) throw new Error(`${where}: "${find}" is not in that paragraph`)
+  if (all.indexOf(find, i + 1) >= 0) throw new Error(`${where}: "${find}" occurs more than once in that paragraph; make find longer`)
+  const after = splitRunAt(p, i + find.length)
+  const first = splitRunAt(p, i)
+  const so = parentOf(p, first)
+  so.kids.splice(so.kids.indexOf(first), 0, start)
+  if (after) { const eo = parentOf(p, after); eo.kids.splice(eo.kids.indexOf(after), 0, end, ref) } else p.kids.push(end, ref)
 }
 
 function setCellText (tc, s) {
@@ -1443,9 +1583,12 @@ export async function editDocxUi (buf, ops, io) {
         break
       }
       case 'table': {
-        const rows = Math.max(1, Math.min(50, +e.rows || 2))
-        const cols = Math.max(1, Math.min(20, +e.cols || 2))
-        const node = await W_().table({ rows: Array.from({ length: rows }, () => Array.from({ length: cols }, () => [])) })
+        // cells (rows of text, as pasted) fill the table and set its size.
+        const given = Array.isArray(e.cells) ? e.cells.slice(0, 500).map((r) => (Array.isArray(r) ? r.slice(0, 50) : [])) : null
+        const rows = given?.length || Math.max(1, Math.min(50, +e.rows || 2))
+        const cols = Math.max(1, given ? Math.max(...given.map((r) => r.length)) : Math.min(20, +e.cols || 2))
+        const cellRuns = (t) => String(t ?? '').split('\n').flatMap((l, i) => [...(i ? [{ br: true }] : []), ...(l ? [{ text: l }] : [])])
+        const node = await W_().table({ rows: Array.from({ length: rows }, (_, r) => Array.from({ length: cols }, (_, c) => (given ? cellRuns(given[r][c]) : []))), header: given ? !!e.header : true })
         const b = e.after ? block(e.after, where) : undefined
         const owner = b?.owner ?? m.body
         let at
@@ -1544,7 +1687,7 @@ export async function editDocxUi (buf, ops, io) {
       case 'comment_delete': deleteComments(m, [String(e.id)], where); break
       case 'toc': {
         const b = e.after ?? e.before ? block(e.after ?? e.before, where) : undefined
-        const sdt = buildToc(m, +e.levels || 3)
+        const sdt = buildToc(m, +e.levels || 3, e.pages)
         const owner = b?.owner ?? m.body
         let at
         if (b) at = owner.kids.indexOf(b.node) + (e.after !== undefined ? 1 : 0)
@@ -1552,7 +1695,7 @@ export async function editDocxUi (buf, ops, io) {
         owner.kids.splice(at, 0, sdt)
         break
       }
-      case 'toc_update': updateToc(m, +e.levels || 3, where); break
+      case 'toc_update': updateToc(m, +e.levels || 3, where, e.pages); break
       case 'toc_delete': {
         const all = tocBlocks(m)
         if (!all.length) throw new Error(`${where}: the document has no table of contents made here`)
@@ -1902,39 +2045,47 @@ function tocEntries (m, levels, skip) {
       b.node.kids.splice(ppr ? b.node.kids.indexOf(ppr) + 1 : 0, 0, mark)
       b.node.kids.push(el('w:bookmarkEnd', { 'w:id': id }))
     }
-    out.push({ lvl, label, anchor: mark.attrs['w:name'] })
+    out.push({ lvl, label, anchor: mark.attrs['w:name'], ref: b.ref })
   }
   return out
 }
 
-// tocContent is the field Word fills in: entries link to their headings;
-// page numbers come when Word or WPS updates the field (it is marked
-// dirty, so Word offers to on opening).
-function tocContent (m, levels, skip) {
+// tocContent is the field Word fills in: entries link to their headings.
+// pages (heading block ref → page, as the editor laid the document out)
+// gives each entry a dotted tab and a PAGEREF field holding that page;
+// the field stays marked dirty, so Word and WPS recount on opening.
+function tocContent (m, levels, skip, pages) {
   const st = ensureTocStyles(m)
   const entries = tocEntries(m, levels, skip)
+  const sect = child(m.body, 'w:sectPr')
+  const pgw = +(child(sect, 'w:pgSz')?.attrs['w:w'] ?? 11906)
+  const mar = child(sect, 'w:pgMar')?.attrs ?? {}
+  const width = Math.max(1440, pgw - +(mar['w:left'] ?? 1440) - +(mar['w:right'] ?? 1440))
+  const pageOf = (x) => { const n = pages?.[x.ref]; return Number.isInteger(+n) && +n > 0 ? String(+n) : undefined }
+  const pageRuns = (x, n) => [el('w:r', {}, [el('w:tab')]), el('w:r', {}, [el('w:fldChar', { 'w:fldCharType': 'begin' })]), el('w:r', {}, [el('w:instrText', { 'xml:space': 'preserve' }, [text(` PAGEREF ${x.anchor} \\h `)])]), el('w:r', {}, [el('w:fldChar', { 'w:fldCharType': 'separate' })]), el('w:r', {}, textNodes(n)), el('w:r', {}, [el('w:fldChar', { 'w:fldCharType': 'end' })])]
+  const entryPr = (x) => pageOf(x) ? pPr(v('w:pStyle', st[`toc ${Math.min(3, x.lvl)}`]), el('w:tabs', {}, [el('w:tab', { 'w:val': 'right', 'w:leader': 'dot', 'w:pos': String(width) })])) : pPr(v('w:pStyle', st[`toc ${Math.min(3, x.lvl)}`]))
   const begin = [el('w:r', {}, [el('w:fldChar', { 'w:fldCharType': 'begin', 'w:dirty': 'true' })]), el('w:r', {}, [el('w:instrText', { 'xml:space': 'preserve' }, [text(` TOC \\o "1-${levels}" \\h \\z \\u `)])]), el('w:r', {}, [el('w:fldChar', { 'w:fldCharType': 'separate' })])]
   const end = el('w:r', {}, [el('w:fldChar', { 'w:fldCharType': 'end' })])
   const title = el('w:p', {}, [pPr(v('w:pStyle', st['toc heading'])), el('w:r', {}, textNodes('目录'))])
   const paras = entries.length
-    ? entries.map((x, i) => el('w:p', {}, [pPr(v('w:pStyle', st[`toc ${Math.min(3, x.lvl)}`])), ...(i === 0 ? begin : []), el('w:hyperlink', { 'w:anchor': x.anchor, 'w:history': '1' }, [el('w:r', {}, textNodes(x.label))]), ...(i === entries.length - 1 ? [end] : [])]))
+    ? entries.map((x, i) => el('w:p', {}, [entryPr(x), ...(i === 0 ? begin : []), el('w:hyperlink', { 'w:anchor': x.anchor, 'w:history': '1' }, [el('w:r', {}, textNodes(x.label)), ...(pageOf(x) ? pageRuns(x, pageOf(x)) : [])]), ...(i === entries.length - 1 ? [end] : [])]))
     : [el('w:p', {}, [...begin, el('w:r', {}, textNodes('未找到目录项：先给标题设上“标题 1/2/3”样式。')), end])]
   return [title, ...paras]
 }
 
-function buildToc (m, levels) {
+function buildToc (m, levels, pages) {
   if (tocBlocks(m).length) throw new Error('the document already has a table of contents; update it instead')
   levels = Math.max(1, Math.min(9, levels))
-  return el('w:sdt', {}, [el('w:sdtPr', {}, [el('w:docPartObj', {}, [v('w:docPartGallery', TOC_GALLERY), el('w:docPartUnique')])]), el('w:sdtContent', {}, tocContent(m, levels, new Set()))])
+  return el('w:sdt', {}, [el('w:sdtPr', {}, [el('w:docPartObj', {}, [v('w:docPartGallery', TOC_GALLERY), el('w:docPartUnique')])]), el('w:sdtContent', {}, tocContent(m, levels, new Set(), pages))])
 }
 
-function updateToc (m, levels, where) {
+function updateToc (m, levels, where, pages) {
   const all = tocBlocks(m)
   if (all.length) {
     const sc = child(all[0], 'w:sdtContent')
     const instr = descendants(sc, 'w:instrText').map(textContent).join('')
     const lv = /\\o\s+"1-(\d)"/.exec(instr)
-    sc.kids = tocContent(m, lv ? +lv[1] : levels, new Set([sc]))
+    sc.kids = tocContent(m, lv ? +lv[1] : levels, new Set([sc]), pages)
     return
   }
   // A TOC field outside a content control: replace its paragraphs.
@@ -1951,7 +2102,7 @@ function updateToc (m, levels, where) {
   const at = owner.kids.indexOf(ps[first])
   const skip = new Set()
   for (let i = first; i <= last; i++) remove(parentOf(m.body, ps[i]), ps[i])
-  const made = tocContent(m, levels, skip).slice(1)
+  const made = tocContent(m, levels, skip, pages).slice(1)
   owner.kids.splice(at, 0, ...made)
 }
 

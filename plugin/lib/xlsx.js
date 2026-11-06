@@ -1019,6 +1019,24 @@ function normalize (spec) {
   return s
 }
 
+// lineIndex reads a column given as a letter (C) or a number (3).
+function lineIndex (v) {
+  if (typeof v === 'number') return v
+  const s = String(v ?? '').trim().toUpperCase()
+  if (/^\d+$/.test(s)) return +s
+  if (!/^[A-Z]{1,3}$/.test(s)) return NaN
+  let n = 0
+  for (const ch of s) n = n * 26 + ch.charCodeAt(0) - 64
+  return n
+}
+
+// chartLook picks the axis and label settings of an Agent chart op.
+function chartLook (e) {
+  const out = {}
+  for (const k of ['labels', 'legend', 'x_title', 'y_title', 'y_min', 'y_max', 'gridlines']) if (e[k] !== undefined) out[k] = e[k]
+  return out
+}
+
 function styleProps (s) {
   const out = {}
   for (const k of ['bold', 'italic', 'underline', 'color', 'fill', 'format', 'align', 'valign', 'wrap', 'border', 'size', 'locked']) if (s[k] !== undefined) out[k] = s[k]
@@ -1047,6 +1065,14 @@ export function readXlsx (buf, { sheet, range, from } = {}) {
       if (mg.length) desc += `, merged ${mg.slice(0, 6).join(' ')}${mg.length > 6 ? ' …' : ''}`
     } catch (e) { desc = e.message }
     lines.push(`- ${s.name}: ${desc}${s.state && s.state !== 'visible' ? ` (${s.state})` : ''}`)
+    // Charts by number, the way xlsx_edit's edit_chart and delete_chart
+    // name them.
+    let charts = []
+    try { charts = sheetCharts(wb, wb.sheet(s.name)) } catch {}
+    for (const ch of charts) {
+      const look = [ch.stacked ? `stacked ${ch.stacked}` : '', ch.labels ? `labels ${ch.labels}` : '', `legend ${ch.legend ?? 'none'}`, ch.xTitle ? `x_title "${ch.xTitle}"` : '', ch.yTitle ? `y_title "${ch.yTitle}"` : '', ch.yMin !== undefined ? `y_min ${ch.yMin}` : '', ch.yMax !== undefined ? `y_max ${ch.yMax}` : '', ch.gridlines === false ? 'no gridlines' : ''].filter(Boolean).join(', ')
+      lines.push(`  - chart ${ch.k + 1}: ${ch.type}${ch.title ? ` "${ch.title}"` : ''} at ${cellName(ch.from.r, ch.from.c)}:${cellName(ch.to.r, ch.to.c)}; series ${ch.series.map((x) => x.name).join(', ') || '(none)'}; ${look}${ch.editable ? '' : ' (mixed kinds: only the title and look can change)'}`)
+    }
   }
   const sh = wb.sheet(sheet)
   const u = sh.usedRange()
@@ -1206,8 +1232,42 @@ export function editXlsx (buf, edits) {
         wb.deleteSheet(e.sheet)
         report.push(`deleted sheet ${e.sheet}`)
         break
+      case 'insert_rows': case 'delete_rows': case 'insert_cols': case 'delete_cols': {
+        const sh = wb.sheet(e.sheet)
+        const rowsAxis = e.op.endsWith('rows')
+        const at = rowsAxis ? +e.at : lineIndex(e.at)
+        if (!(at >= 1)) throw new Error(`${where}: at must be a ${rowsAxis ? 'row number like 5' : 'column like C'}`)
+        const n = Math.max(1, Math.min(10000, +e.count || 1))
+        moveLines(wb, sh, rowsAxis ? 'r' : 'c', at, e.op.startsWith('insert') ? n : -n, wrote)
+        const what = rowsAxis ? `row${n > 1 ? 's' : ''} ${at}${n > 1 ? `–${at + n - 1}` : ''}` : `column${n > 1 ? 's' : ''} ${colName(at)}${n > 1 ? `–${colName(at + n - 1)}` : ''}`
+        report.push(`${e.op.startsWith('insert') ? 'inserted' : 'deleted'} ${sh.info.name} ${what}`)
+        break
+      }
+      case 'add_chart': {
+        const sh = wb.sheet(e.sheet)
+        const spec = { range: e.range, type: e.type, title: e.title, stacked: e.stacked, w: e.width, h: e.height }
+        if (e.at !== undefined) {
+          const p = parseCell(String(e.at))
+          if (!p) throw new Error(`${where}: at "${e.at}" is not a cell like H2`)
+          spec.at = { c: p.c, r: p.r }
+        }
+        addChart(wb, sh, spec, where)
+        const k = sheetCharts(wb, sh).length
+        if (Object.keys(chartLook(e)).length) editChart(wb, sh, { chart: k - 1, ...chartLook(e) }, where)
+        report.push(`added chart ${k} on ${sh.info.name} from ${e.range}`)
+        break
+      }
+      case 'edit_chart': case 'delete_chart': {
+        const sh = wb.sheet(e.sheet)
+        const k = +e.chart
+        if (!(k >= 1)) throw new Error(`${where}: chart must be a chart number from office_read, like 1`)
+        if (e.op === 'delete_chart') deleteChart(wb, sh, { chart: k - 1 }, where)
+        else editChart(wb, sh, { chart: k - 1, title: e.title, type: e.type, stacked: e.stacked, ...chartLook(e) }, where)
+        report.push(`${e.op === 'delete_chart' ? 'deleted' : 'edited'} chart ${k} on ${sh.info.name}`)
+        break
+      }
       default:
-        throw new Error(`${where}: unknown op; use set, write, style, clear, freeze, add_sheet, rename_sheet or delete_sheet`)
+        throw new Error(`${where}: unknown op; use set, write, style, clear, freeze, add_sheet, rename_sheet, delete_sheet, insert_rows, delete_rows, insert_cols, delete_cols, add_chart, edit_chart or delete_chart`)
     }
   }
   const unsupported = wb.recalc(wrote)

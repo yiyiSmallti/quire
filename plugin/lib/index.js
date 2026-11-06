@@ -148,7 +148,9 @@ export function apply (ctx) {
         '{op:"replace", find, replace, all?} text in body, tables, headers and footers, even across formatting; keeps the formatting where the match starts; fails when find is not unique unless all: true.\n' +
         '{op:"insert", after|before: "p12", markdown} new blocks next to a block. {op:"append", markdown} at the end.\n' +
         '{op:"set", block: "p12", markdown} replace a block. {op:"delete", blocks: ["p3","t1"]}.\n' +
-        '{op:"cell", table: "t1", row, col, text} set a table cell (1-based), keeping its formatting.',
+        '{op:"cell", table: "t1", row, col, text} set a table cell (1-based), keeping its formatting.\n' +
+        'Review (comment and change numbers come from office_read): {op:"comment", block: "p12", find?, text, author?} a comment on the text find inside the block (once there), or on the whole block. {op:"reply", comment: 3, text}. {op:"resolve", comment: 3, done?: false to reopen}. {op:"delete_comment", comment: 3} with its replies.\n' +
+        '{op:"accept"|"reject", id?: 7, block?: "p12"} tracked changes: one, those in a block, or all. {op:"track", on: true|false} turns Track Changes on or off for people editing in Word (these edits themselves are not tracked).',
       parameters: {
         type: 'object',
         properties: {
@@ -159,7 +161,12 @@ export function apply (ctx) {
             items: {
               type: 'object',
               properties: {
-                op: { type: 'string', enum: ['replace', 'insert', 'append', 'set', 'delete', 'cell'] },
+                op: { type: 'string', enum: ['replace', 'insert', 'append', 'set', 'delete', 'cell', 'comment', 'reply', 'resolve', 'delete_comment', 'accept', 'reject', 'track'] },
+                comment: { type: ['integer', 'string'] },
+                id: { type: ['integer', 'string'] },
+                author: STR,
+                done: { type: 'boolean' },
+                on: { type: 'boolean' },
                 find: STR,
                 replace: STR,
                 all: { type: 'boolean' },
@@ -217,7 +224,11 @@ export function apply (ctx) {
         '{op:"set", sheet?, cell: "B3", value?|formula?, format?, bold?, italic?, color?, fill?, align?, wrap?} one cell (a value string starting with = is a formula).\n' +
         '{op:"write", sheet?, at: "A1", rows: [[…]]} a block of cells, like xlsx_create rows.\n' +
         '{op:"style", sheet?, range: "A1:D1", bold?, italic?, color?, fill?, format?, align?, wrap?, width?} format cells; width sets the columns\' width in characters.\n' +
-        '{op:"clear", sheet?, range}. {op:"freeze", sheet?, cell: "B2"}. {op:"add_sheet", name, rows?}. {op:"rename_sheet", sheet, name} (formulas follow). {op:"delete_sheet", sheet}.',
+        '{op:"clear", sheet?, range}. {op:"freeze", sheet?, cell: "B2"}. {op:"add_sheet", name, rows?}. {op:"rename_sheet", sheet, name} (formulas follow). {op:"delete_sheet", sheet}.\n' +
+        '{op:"insert_rows"|"delete_rows", sheet?, at: 5, count?} and {op:"insert_cols"|"delete_cols", sheet?, at: "C", count?}: formulas, merges, charts and the rest follow the move.\n' +
+        '{op:"add_chart", sheet?, range: "A1:C10", type?: col|bar|line|area|pie|doughnut|scatter, title?, at?: "H2", width?, height? (pixels), stacked?: "stacked"|"percent", …look} a chart from a range (a text first row names the series, a text first column labels the categories).\n' +
+        '{op:"edit_chart", sheet?, chart: 1, title?, type?, stacked?, …look} and {op:"delete_chart", sheet?, chart: 1}: chart numbers are the ones office_read lists.\n' +
+        'look: labels (value|percent|category|none), legend (r|b|t|l|tr|none), x_title, y_title (empty removes), y_min, y_max (null for automatic), gridlines (boolean).',
       parameters: {
         type: 'object',
         properties: {
@@ -228,10 +239,23 @@ export function apply (ctx) {
             items: {
               type: 'object',
               properties: {
-                op: { type: 'string', enum: ['set', 'write', 'style', 'clear', 'freeze', 'add_sheet', 'rename_sheet', 'delete_sheet'] },
+                op: { type: 'string', enum: ['set', 'write', 'style', 'clear', 'freeze', 'add_sheet', 'rename_sheet', 'delete_sheet', 'insert_rows', 'delete_rows', 'insert_cols', 'delete_cols', 'add_chart', 'edit_chart', 'delete_chart'] },
                 sheet: STR,
                 cell: STR,
-                at: STR,
+                at: { type: ['string', 'number'] },
+                count: { type: 'number' },
+                chart: { type: 'number' },
+                type: { type: 'string', enum: ['col', 'bar', 'line', 'area', 'pie', 'doughnut', 'scatter'] },
+                title: STR,
+                stacked: { type: ['string', 'null'], enum: ['stacked', 'percent', null] },
+                height: { type: 'number' },
+                labels: { type: 'string', enum: ['value', 'percent', 'category', 'none'] },
+                legend: { type: 'string', enum: ['r', 'b', 't', 'l', 'tr', 'none'] },
+                x_title: STR,
+                y_title: STR,
+                y_min: { type: ['number', 'null'] },
+                y_max: { type: ['number', 'null'] },
+                gridlines: { type: 'boolean' },
                 range: STR,
                 rows: ROWS,
                 name: STR,

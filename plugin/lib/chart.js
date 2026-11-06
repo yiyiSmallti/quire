@@ -117,7 +117,7 @@ function chartAt (wb, sh, k, where) {
 
 // resolve reads a range formula like 'Sheet 1'!$B$2:$B$9 from the cells,
 // row by row; undefined when it is not a plain range on a worksheet.
-function resolve (wb, f, shown) {
+function resolve (wb, f, shown, visOnly) {
   const m = /^(?:'((?:[^']|'')+)'|([^!'"]+))!\$?([A-Z]+)\$?(\d+)(?::\$?([A-Z]+)\$?(\d+))?$/.exec(String(f ?? '').trim())
   if (!m) return undefined
   const name = (m[1] ?? m[2]).replace(/''/g, "'")
@@ -126,12 +126,22 @@ function resolve (wb, f, shown) {
   const rg = parseRange(`${m[3]}${m[4]}:${m[5] ?? m[3]}${m[6] ?? m[4]}`)
   if (!rg || (rg.r2 - rg.r1 + 1) * (rg.c2 - rg.c1 + 1) > 5000) return undefined
   const out = []
+  const hidCols = visOnly ? hiddenCols(sh) : null
   for (let r = rg.r1; r <= rg.r2; r++) {
+    if (visOnly && sh.rows.get(r)?.attrs.hidden === '1') continue
     for (let c = rg.c1; c <= rg.c2; c++) {
+      if (hidCols?.has(c)) continue
       if (shown) out.push(String(sh.display(r, c) ?? ''))
       else { const v = sh.value(sh.cellAt(r, c)); out.push(typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' && Number.isFinite(+v) ? +v : null) }
     }
   }
+  return out
+}
+
+// hiddenCols lists the columns a sheet hides.
+function hiddenCols (sh) {
+  const out = new Set()
+  for (const c of kids(kid(sh.root, 'cols'), 'col')) if (c.attrs.hidden === '1' || c.attrs.hidden === 'true') for (let i = +c.attrs.min; i <= Math.min(+c.attrs.max, 16384); i++) out.add(i)
   return out
 }
 
@@ -146,12 +156,12 @@ function cacheOf (ref) {
 
 // dataOf reads a cat/val/tx element: its formula and values (from the
 // cells when they resolve, else the cache).
-function dataOf (wb, node, shown) {
+function dataOf (wb, node, shown, visOnly) {
   if (!node) return undefined
   const ref = kid(node, 'strRef') ?? kid(node, 'numRef') ?? kid(node, 'multiLvlStrRef')
   if (ref) {
     const f = textContent(kid(ref, 'f'))
-    const live = resolve(wb, f, shown)
+    const live = resolve(wb, f, shown, visOnly)
     const vals = live ?? cacheOf(ref).map((x) => (shown ? (x ?? '') : x === null || x === '' ? null : +x))
     return { f, vals }
   }
@@ -190,13 +200,16 @@ function parseChart (wb, part) {
   if (type === 'col' && val(kid(first, 'barDir')) === 'bar') type = 'bar'
   const grouping = val(kid(first, 'grouping'))
   const theme = wb.loadTheme?.()
+  // Hidden rows and columns (a filter's too) are left out unless the
+  // chart says to plot them.
+  const visOnly = val(kid(chart, 'plotVisOnly')) !== '0'
   const series = []
   for (const t of typeEls) {
     for (const ser of kids(t, 'ser')) {
       const tx = kid(ser, 'tx')
       const name = tx ? (dataOf(wb, tx, true)?.vals ?? []).join(' ') : ''
-      const cat = dataOf(wb, kid(ser, 'cat') ?? kid(ser, 'xVal'), true)
-      const vals = dataOf(wb, kid(ser, 'val') ?? kid(ser, 'yVal'), false)
+      const cat = dataOf(wb, kid(ser, 'cat') ?? kid(ser, 'xVal'), true, visOnly)
+      const vals = dataOf(wb, kid(ser, 'val') ?? kid(ser, 'yVal'), false, visOnly)
       series.push({ name: name || `系列${series.length + 1}`, cats: cat?.vals ?? [], vals: vals?.vals ?? [], color: colorOf(ser, theme, series.length) })
     }
   }
@@ -214,8 +227,35 @@ function parseChart (wb, part) {
     stacked: grouping === 'stacked' ? 'stacked' : grouping === 'percentStacked' ? 'percent' : undefined,
     title,
     legend: legend ? (val(kid(legend, 'legendPos')) ?? 'r') : null,
+    ...lookOf(plot, first),
     series
   }
+}
+
+// chartAxes finds the axis along the categories (x) and the value axis
+// (y): for a scatter chart the bottom and the other value axis.
+function chartAxes (plot) {
+  const all = (plot?.kids ?? []).filter((k) => ['catAx', 'valAx', 'dateAx'].includes(local(k)))
+  let x = all.find((a) => local(a) !== 'valAx')
+  if (!x) x = all.find((a) => ['b', 't'].includes(val(kid(a, 'axPos')))) ?? all[0]
+  const y = all.find((a) => a !== x && local(a) === 'valAx')
+  return { x, y }
+}
+
+function dLblsOf (typeEl) {
+  return kid(typeEl, 'dLbls') ?? kid(kids(typeEl, 'ser')[0], 'dLbls')
+}
+
+// lookOf reads the settings the options dialog changes.
+function lookOf (plot, typeEl) {
+  const d = dLblsOf(typeEl)
+  const on = (name) => val(kid(d, name)) === '1' || val(kid(d, name)) === 'true'
+  const labels = d && !kid(d, 'delete') ? (on('showPercent') ? 'percent' : on('showVal') ? 'value' : on('showCatName') ? 'category' : null) : null
+  const { x, y } = chartAxes(plot)
+  const axTitle = (a) => { const t = kid(a, 'title'); if (!t) return undefined; const rich = kid(kid(t, 'tx'), 'rich'); return rich ? richText(rich) : '' }
+  const sc = kid(y, 'scaling')
+  const num = (n) => (n && Number.isFinite(+val(n)) ? +val(n) : undefined)
+  return { labels, xTitle: axTitle(x), yTitle: axTitle(y), yMin: num(kid(sc, 'min')), yMax: num(kid(sc, 'max')), gridlines: y ? !!kid(y, 'majorGridlines') : undefined }
 }
 
 // sheetCharts is what the editor needs to draw a sheet's charts.
@@ -265,9 +305,11 @@ function retag (node, name) {
   return node
 }
 
+const gridlinesXml = () => el('c:majorGridlines', {}, [el('c:spPr', {}, [el('a:ln', { w: '9525' }, [el('a:solidFill', {}, [el('a:srgbClr', { val: 'D9D9D9' })])])])])
+
 function axes (type) {
   if (type === 'pie' || type === 'doughnut') return []
-  const gridlines = el('c:majorGridlines', {}, [el('c:spPr', {}, [el('a:ln', { w: '9525' }, [el('a:solidFill', {}, [el('a:srgbClr', { val: 'D9D9D9' })])])])])
+  const gridlines = gridlinesXml()
   const common = (id, cross, pos) => [cv('axId', id), el('c:scaling', {}, [cv('orientation', 'minMax')]), cv('delete', 0), cv('axPos', pos)]
   const ticks = (cross) => [cv('majorTickMark', 'out'), cv('minorTickMark', 'none'), cv('tickLblPos', 'nextTo'), cv('crossAx', cross), cv('crosses', 'autoZero')]
   const horiz = type === 'bar'
@@ -285,13 +327,13 @@ function typeXml (type, sers, stacked) {
   if (type === 'col' || type === 'bar') return el('c:barChart', {}, [cv('barDir', type === 'bar' ? 'bar' : 'col'), cv('grouping', grouping ?? 'clustered'), cv('varyColors', 0), ...sers, cv('gapWidth', 150), grouping ? cv('overlap', 100) : null, ...axIds])
   if (type === 'line') return el('c:lineChart', {}, [cv('grouping', grouping ?? 'standard'), cv('varyColors', 0), ...sers, cv('marker', 1), ...axIds])
   if (type === 'area') return el('c:areaChart', {}, [cv('grouping', grouping ?? 'standard'), cv('varyColors', 0), ...sers, ...axIds])
-  if (type === 'pie') return el('c:pieChart', {}, [cv('varyColors', 1), ...sers, cv('firstSliceAng', 0)])
-  if (type === 'doughnut') return el('c:doughnutChart', {}, [cv('varyColors', 1), ...sers, cv('firstSliceAng', 0), cv('holeSize', 50)])
+  if (type === 'pie') return el('c:pieChart', {}, [cv('varyColors', 1), ...sers, dLblsXml('percent', true), cv('firstSliceAng', 0)])
+  if (type === 'doughnut') return el('c:doughnutChart', {}, [cv('varyColors', 1), ...sers, dLblsXml('percent', true), cv('firstSliceAng', 0), cv('holeSize', 50)])
   return el('c:scatterChart', {}, [cv('scatterStyle', 'lineMarker'), cv('varyColors', 0), ...sers, ...axIds])
 }
 
-function titleXml (title) {
-  return el('c:title', {}, [el('c:tx', {}, [el('c:rich', {}, [el('a:bodyPr'), el('a:lstStyle'), el('a:p', {}, [el('a:pPr', {}, [el('a:defRPr', { sz: '1400', b: '0' })]), el('a:r', {}, [el('a:rPr', { lang: 'zh-CN', altLang: 'en-US' }), el('a:t', {}, [text(title)])])])])]), cv('overlay', 0)])
+function titleXml (title, sz = 1400, rot) {
+  return el('c:title', {}, [el('c:tx', {}, [el('c:rich', {}, [el('a:bodyPr', rot ? { rot: String(rot), vert: 'horz' } : {}), el('a:lstStyle'), el('a:p', {}, [el('a:pPr', {}, [el('a:defRPr', { sz: String(sz), b: '0' })]), el('a:r', {}, [el('a:rPr', { lang: 'zh-CN', altLang: 'en-US' }), el('a:t', {}, [text(title)])])])])]), cv('overlay', 0)])
 }
 
 function chartXml (type, sers, title, stacked) {
@@ -428,6 +470,11 @@ export function editChart (wb, sh, e, where) {
     const plot = kid(chart, 'plotArea')
     const old = plot.kids.find((k) => TYPE_OF[local(k)])
     const sers = kids(old, 'ser').map((s, i) => serXml(type, i, { tx: kid(s, 'tx'), cat: kid(s, 'cat') ?? kid(s, 'xVal'), val: kid(s, 'val') ?? kid(s, 'yVal') }, info.series[i]?.color ?? PALETTE[i % PALETTE.length]))
+    // The new axes keep the old titles, bounds and gridlines.
+    const was = lookOf(plot, old)
+    const toPie = type === 'pie' || type === 'doughnut'
+    const carry = { ...(was.labels ? { labels: was.labels } : {}), ...(toPie || was.gridlines === undefined ? {} : { x_title: was.xTitle, y_title: was.yTitle, y_min: was.yMin ?? null, y_max: was.yMax ?? null, gridlines: was.gridlines }) }
+    for (const [k, v] of Object.entries(carry)) if (e[k] === undefined && v !== undefined) e = { ...e, [k]: v }
     const keep = plot.kids.filter((k) => isEl(k) && ['layout'].includes(local(k)))
     const tail = plot.kids.filter((k) => isEl(k) && ['dTable', 'spPr', 'extLst'].includes(local(k)))
     plot.kids = [...keep, typeXml(type, sers, e.stacked !== undefined ? e.stacked : info.stacked), ...axes(type), ...tail]
@@ -435,7 +482,91 @@ export function editChart (wb, sh, e, where) {
     const pos = legend && kid(legend, 'legendPos')
     if (pos && (type === 'pie' || type === 'doughnut')) pos.attrs.val = 'r'
   }
+  applyLook(chart, e, where)
   wb.pkg.touch(part)
+}
+
+const LEGEND_POS = ['r', 'b', 't', 'l', 'tr']
+
+// dLblsXml shows one thing on every point: its value, its share of the
+// pie (percent; a value elsewhere) or its category.
+function dLblsXml (mode, pie) {
+  const show = (k) => cv(k, (mode === 'value' && k === 'showVal') || (mode === 'category' && k === 'showCatName') || (mode === 'percent' && k === (pie ? 'showPercent' : 'showVal')) ? 1 : 0)
+  return el('c:dLbls', {}, [show('showLegendKey'), show('showVal'), show('showCatName'), show('showSerName'), show('showPercent'), show('showBubbleSize'), pie ? cv('showLeaderLines', 1) : null])
+}
+const AXIS_AFTER = ['axId', 'scaling', 'delete', 'axPos', 'majorGridlines', 'minorGridlines', 'title']
+
+// putAxisKid puts node in an axis where the schema wants it: after the
+// children named in AXIS_AFTER up to its own name, before the rest.
+function putAxisKid (ax, node) {
+  const name = local(node)
+  ax.kids = ax.kids.filter((k) => local(k) !== name)
+  const upto = AXIS_AFTER.slice(0, AXIS_AFTER.indexOf(name))
+  let i = 0
+  ax.kids.forEach((k, j) => { if (isEl(k) && upto.includes(local(k))) i = j + 1 })
+  ax.kids.splice(i, 0, node)
+}
+
+// applyLook sets data labels, the legend, axis titles, the value axis
+// bounds and its gridlines; a key left out stays as it is.
+function applyLook (chart, e, where) {
+  const plot = kid(chart, 'plotArea')
+  const typeEl = plot?.kids.find((k) => TYPE_OF[local(k)])
+  if (e.labels !== undefined && typeEl) {
+    const mode = e.labels === true ? 'value' : e.labels || null
+    if (mode && !['value', 'percent', 'category', 'none'].includes(mode)) throw new Error(`${where}: labels must be value, percent, category or none`)
+    for (const s of kids(typeEl, 'ser')) s.kids = s.kids.filter((k) => local(k) !== 'dLbls')
+    typeEl.kids = typeEl.kids.filter((k) => local(k) !== 'dLbls')
+    if (mode && mode !== 'none') {
+      const d = dLblsXml(mode, /^(pie|doughnut|ofPie|pie3D)Chart$/.test(local(typeEl)))
+      const sers = kids(typeEl, 'ser')
+      const at = sers.length ? typeEl.kids.indexOf(sers[sers.length - 1]) + 1 : typeEl.kids.findIndex((k) => isEl(k) && !['barDir', 'grouping', 'varyColors', 'scatterStyle', 'radarStyle', 'wireframe'].includes(local(k)))
+      typeEl.kids.splice(at < 0 ? typeEl.kids.length : at, 0, d)
+    }
+  }
+  if (e.legend !== undefined) {
+    const pos = e.legend === false || e.legend === 'none' ? null : String(e.legend)
+    if (pos && !LEGEND_POS.includes(pos)) throw new Error(`${where}: legend must be r, b, t, l, tr or none`)
+    let legend = kid(chart, 'legend')
+    if (!pos) chart.kids = chart.kids.filter((k) => local(k) !== 'legend')
+    else if (legend) { const lp = kid(legend, 'legendPos'); if (lp) lp.attrs.val = pos; else legend.kids.unshift(cv('legendPos', pos)) } else {
+      legend = el('c:legend', {}, [cv('legendPos', pos), cv('overlay', 0)])
+      chart.kids.splice(chart.kids.indexOf(plot) + 1, 0, legend)
+    }
+  }
+  const { x, y } = chartAxes(plot)
+  const axTitle = (ax, t, rot) => {
+    if (t === undefined || !ax) return
+    const s = String(t ?? '').trim()
+    if (s) putAxisKid(ax, titleXml(s, 1000, rot))
+    else ax.kids = ax.kids.filter((k) => local(k) !== 'title')
+  }
+  if ((e.x_title !== undefined && !x) || ((e.y_title !== undefined || e.y_min !== undefined || e.y_max !== undefined || e.gridlines !== undefined) && !y)) throw new Error(`${where}: a pie or doughnut chart has no axes`)
+  const horiz = typeEl && val(kid(typeEl, 'barDir')) === 'bar'
+  axTitle(x, e.x_title, horiz ? -5400000 : 0)
+  axTitle(y, e.y_title, horiz ? 0 : -5400000)
+  for (const [key, name] of [['y_min', 'min'], ['y_max', 'max']]) {
+    if (e[key] === undefined) continue
+    let sc = kid(y, 'scaling')
+    if (!sc) { sc = el('c:scaling', {}, [cv('orientation', 'minMax')]); putAxisKid(y, sc) }
+    sc.kids = sc.kids.filter((k) => local(k) !== name)
+    const v = e[key] === null || e[key] === '' ? undefined : +e[key]
+    if (v !== undefined && !Number.isFinite(v)) throw new Error(`${where}: ${key} must be a number`)
+    if (v === undefined) continue
+    // CT_Scaling: logBase?, orientation?, max?, min?
+    const order = ['logBase', 'orientation', 'max', 'min']
+    let i = 0
+    sc.kids.forEach((k, j) => { if (isEl(k) && order.indexOf(local(k)) < order.indexOf(name)) i = j + 1 })
+    sc.kids.splice(i, 0, cv(name, v))
+  }
+  if (y) {
+    const sc = kid(y, 'scaling')
+    const lo = +val(kid(sc, 'min')); const hi = +val(kid(sc, 'max'))
+    if (Number.isFinite(lo) && Number.isFinite(hi) && kid(sc, 'min') && kid(sc, 'max') && lo >= hi) throw new Error(`${where}: y_min must be below y_max`)
+  }
+  if (e.gridlines !== undefined) {
+    if (e.gridlines) { if (!kid(y, 'majorGridlines')) putAxisKid(y, gridlinesXml()) } else y.kids = y.kids.filter((k) => local(k) !== 'majorGridlines')
+  }
 }
 
 // refreshCharts rewrites every series cache from the cells it refers to.

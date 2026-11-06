@@ -148,6 +148,28 @@ window.__ModuleLoader__.load({
       }
     }
 
+    // htmlTable reads pasted HTML that is one table and nothing else (from
+    // Word, Excel or a web page) as rows of cell text; spanned cells leave
+    // blanks after them. The header is a first row of <th> or a <thead>.
+    function htmlTable (html) {
+      const docu = new DOMParser().parseFromString(html, 'text/html')
+      const tables = docu.body.querySelectorAll('table')
+      const t = tables[0]
+      if (!t || [...tables].some((x) => x !== t && !t.contains(x))) return null
+      const squash = (s) => s.replace(/\s+/g, '')
+      if (squash(docu.body.textContent) !== squash(t.textContent)) return null
+      const text = (n) => {
+        let out = ''
+        const walk = (x) => { for (const c of x.childNodes) { if (c.nodeType === 3) out += c.data.replace(/[\t\n\r ]+/g, ' '); else if (c.tagName === 'BR') out += '\n'; else if (c.nodeType === 1 && !/^(STYLE|SCRIPT)$/.test(c.tagName)) { if (/^(P|DIV|LI)$/.test(c.tagName) && out && !out.endsWith('\n')) out += '\n'; walk(c) } } }
+        walk(n)
+        return out.split('\n').map((l) => l.trim()).join('\n').replace(/^\n+|\n+$/g, '')
+      }
+      const rows = [...t.rows].map((tr) => [...tr.cells].flatMap((td) => [text(td), ...Array.from({ length: Math.min(20, +td.colSpan || 1) - 1 }, () => '')]))
+      if (!rows.length || !rows.some((r) => r.length)) return null
+      const header = !!t.tHead || (t.rows[0] && [...t.rows[0].cells].every((c) => c.tagName === 'TH'))
+      return { rows, header }
+    }
+
     // parseHtml turns pasted HTML into paragraphs of runs the editor knows:
     // bold, italic, underline, strike, colour, highlight, size, font,
     // super/subscript and links; headings, quotes, code and lists.
@@ -1400,7 +1422,7 @@ window.__ModuleLoader__.load({
     function chartSvg (ch, W, H) {
       const out = []
       const f1 = (v) => Math.round(v * 10) / 10
-      const txt = (x, y, s, o = {}) => `<text x="${f1(x)}" y="${f1(y)}" font-size="${o.size ?? 10}" fill="${o.fill ?? '#595959'}" text-anchor="${o.anchor ?? 'middle'}"${o.bold ? ' font-weight="600"' : ''}>${esc(s)}</text>`
+      const txt = (x, y, s, o = {}) => `<text x="${f1(x)}" y="${f1(y)}" font-size="${o.size ?? 10}" fill="${o.fill ?? '#595959'}" text-anchor="${o.anchor ?? 'middle'}"${o.bold ? ' font-weight="600"' : ''}${o.rot ? ` transform="rotate(${o.rot} ${f1(x)} ${f1(y)})"` : ''}>${esc(s)}</text>`
       const line = (a, b, c, d, col, w = 1) => `<line x1="${f1(a)}" y1="${f1(b)}" x2="${f1(c)}" y2="${f1(d)}" stroke="${col}" stroke-width="${w}"/>`
       const box = (x, y, w, h, col) => `<rect x="${f1(x)}" y="${f1(y)}" width="${f1(Math.max(0, w))}" height="${f1(Math.max(0, h))}" fill="#${col}"/>`
       const svg = () => `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" font-family='${FONT}'>${out.join('')}</svg>`
@@ -1412,24 +1434,48 @@ window.__ModuleLoader__.load({
       if (!series.length) { out.push(txt(W / 2, H / 2, '没有可显示的数据')); return svg() }
       const first = series[0]
       const legend = pie ? first.vals.map((_, i) => [String(first.cats[i] ?? i + 1), CHART_COLORS[i % CHART_COLORS.length]]) : series.map((x) => [x.name, x.color])
-      if (ch.legend !== null) {
-        if (pie) {
-          const lw = Math.min(W * 0.4, 16 + Math.max(...legend.map(([n]) => textW(n))))
-          legend.slice(0, Math.max(1, Math.floor((y1 - y0) / 16))).forEach(([n, c], i) => { const y = y0 + 6 + i * 16; out.push(box(x1 - lw, y + 2, 9, 9, c), txt(x1 - lw + 13, y + 10, clipText(n, lw - 14), { anchor: 'start' })) })
-          x1 -= lw + 8
-        } else {
-          const rows = []; let row = []; let rw = 0
-          for (const it of legend) { const iw = 24 + textW(it[0]); if (rw + iw > x1 - x0 && row.length) { rows.push([row, rw]); row = []; rw = 0 } row.push(it); rw += iw }
-          if (row.length) rows.push([row, rw])
-          const shown = rows.slice(0, 2)
-          shown.forEach(([items, w], ri) => {
-            let x = Math.max(x0, (W - w) / 2)
-            const y = y1 - (shown.length - ri) * 16 + 4
-            for (const [n, c] of items) { out.push(box(x, y + 2, 9, 9, c), txt(x + 13, y + 10, n, { anchor: 'start' })); x += 24 + textW(n) }
-          })
-          y1 -= shown.length * 16 + 2
-        }
+      // The legend sits where the file says: a column on the right or
+      // left (r, l, tr), or rows above or below (t, b).
+      const lp = ch.legend === null ? null : ch.legend ?? (pie ? 'r' : 'b')
+      if (lp && ['r', 'l', 'tr'].includes(lp)) {
+        const lw = Math.min(W * 0.4, 16 + Math.max(...legend.map(([n]) => textW(n))))
+        const items = legend.slice(0, Math.max(1, Math.floor((y1 - y0) / 16)))
+        const top = lp === 'tr' ? y0 : Math.max(y0, (y0 + y1) / 2 - items.length * 8)
+        const lx = lp === 'l' ? x0 : x1 - lw
+        items.forEach(([n, c], i) => { const y = top + 2 + i * 16; out.push(box(lx, y + 2, 9, 9, c), txt(lx + 13, y + 10, clipText(n, lw - 14), { anchor: 'start' })) })
+        if (lp === 'l') x0 += lw + 8; else x1 -= lw + 8
+      } else if (lp) {
+        const rows = []; let row = []; let rw = 0
+        for (const it of legend) { const iw = 24 + textW(it[0]); if (rw + iw > x1 - x0 && row.length) { rows.push([row, rw]); row = []; rw = 0 } row.push(it); rw += iw }
+        if (row.length) rows.push([row, rw])
+        const shown = rows.slice(0, 2)
+        shown.forEach(([items, w], ri) => {
+          let x = Math.max(x0, (W - w) / 2)
+          const y = lp === 't' ? y0 + ri * 16 : y1 - (shown.length - ri) * 16 + 4
+          for (const [n, c] of items) { out.push(box(x, y + 2, 9, 9, c), txt(x + 13, y + 10, n, { anchor: 'start' })); x += 24 + textW(n) }
+        })
+        if (lp === 't') y0 += shown.length * 16 + 4; else y1 -= shown.length * 16 + 2
       }
+      // Axis titles: the one along the left turned on its side.
+      if (!pie) {
+        const horiz = ch.type === 'bar'
+        const left = horiz ? ch.xTitle : ch.yTitle
+        const bottom = horiz ? ch.yTitle : ch.xTitle
+        if (bottom) { out.push(txt((x0 + x1) / 2, y1 - 2, clipText(bottom, x1 - x0), { size: 11, fill: '#404040' })); y1 -= 16 }
+        if (left) { out.push(txt(x0 + 9, (y0 + y1) / 2, clipText(left, y1 - y0), { size: 11, fill: '#404040', rot: -90 })); x0 += 16 }
+      }
+      // Data labels: the value, the pie share or the category of a point.
+      const fmtVal = (v) => (Math.abs(v) >= 1000 ? Math.round(v).toLocaleString('en-US') : String(+v.toPrecision(4)))
+      const label = (v, cat, share) => (ch.labels === 'category' ? String(cat ?? '') : ch.labels === 'percent' && share !== undefined ? Math.round(share * 100) + '%' : fmtVal(v))
+      // The value axis: its ticks, inside the bounds the file fixes.
+      const valTicks = (lo, hi) => {
+        const a = typeof ch.yMin === 'number' ? ch.yMin : lo; const b = typeof ch.yMax === 'number' ? ch.yMax : hi
+        let t = niceTicks(a, b > a ? b : a + 1)
+        if (typeof ch.yMin === 'number') { t = t.filter((v) => v > a); t.unshift(a) }
+        if (typeof ch.yMax === 'number' && ch.yMax > t[0]) { t = t.filter((v) => v < ch.yMax); t.push(ch.yMax) }
+        return t
+      }
+      const grid = ch.gridlines !== false
       if (pie) {
         const vals = first.vals.map((v) => Math.max(0, num(v) ?? 0))
         const total = vals.reduce((a, b) => a + b, 0)
@@ -1442,7 +1488,7 @@ window.__ModuleLoader__.load({
           const b = a + v / total * Math.PI * 2
           if (v === total) out.push(`<circle cx="${f1(cx)}" cy="${f1(cy)}" r="${f1(r)}" fill="#${c}"/>`)
           else out.push(`<path d="M${f1(cx)} ${f1(cy)}L${f1(cx + r * Math.cos(a))} ${f1(cy + r * Math.sin(a))}A${f1(r)} ${f1(r)} 0 ${b - a > Math.PI ? 1 : 0} 1 ${f1(cx + r * Math.cos(b))} ${f1(cy + r * Math.sin(b))}Z" fill="#${c}" stroke="#fff" stroke-width="1"/>`)
-          if (v / total > 0.06 && r > 40) { const m = (a + b) / 2; const k = ch.type === 'doughnut' ? 0.75 : 0.62; out.push(txt(cx + r * k * Math.cos(m), cy + r * k * Math.sin(m) + 3.5, Math.round(v / total * 100) + '%', { fill: '#fff', bold: 1 })) }
+          if (ch.labels && v / total > 0.06 && r > 40) { const m = (a + b) / 2; const k = ch.type === 'doughnut' ? 0.75 : 0.62; out.push(txt(cx + r * k * Math.cos(m), cy + r * k * Math.sin(m) + 3.5, clipText(label(v, first.cats[i], v / total), r * 0.8), { fill: '#fff', bold: 1 })) }
           a = b
         })
         if (ch.type === 'doughnut') out.push(`<circle cx="${f1(cx)}" cy="${f1(cy)}" r="${f1(r * 0.5)}" fill="#fff"/>`)
@@ -1453,14 +1499,14 @@ window.__ModuleLoader__.load({
         const all = pts.flat()
         if (!all.length) return svg()
         const xt = niceTicks(Math.min(0, ...all.map((p) => p[0])), Math.max(...all.map((p) => p[0])))
-        const yt = niceTicks(Math.min(0, ...all.map((p) => p[1])), Math.max(...all.map((p) => p[1])))
+        const yt = valTicks(Math.min(0, ...all.map((p) => p[1])), Math.max(...all.map((p) => p[1])))
         const px0 = x0 + Math.max(...yt.map((v) => textW(tickText(v)))) + 6; const px1 = x1 - 6; const py0 = y0 + 4; const py1 = y1 - 16
         if (px1 - px0 < 20 || py1 - py0 < 20) return svg()
         const X = (v) => px0 + (v - xt[0]) / (xt[xt.length - 1] - xt[0]) * (px1 - px0)
         const Y = (v) => py1 - (v - yt[0]) / (yt[yt.length - 1] - yt[0]) * (py1 - py0)
-        for (const v of yt) out.push(line(px0, Y(v), px1, Y(v), '#d9d9d9'), txt(px0 - 4, Y(v) + 3.5, tickText(v), { anchor: 'end' }))
-        for (const v of xt) out.push(line(X(v), py0, X(v), py1, '#ececec'), txt(X(v), py1 + 12, tickText(v)))
-        pts.forEach((ps, si) => { for (const [a, b] of ps) out.push(`<circle cx="${f1(X(a))}" cy="${f1(Y(b))}" r="3.5" fill="#${series[si].color}"/>`) })
+        for (const v of yt) out.push(grid ? line(px0, Y(v), px1, Y(v), '#d9d9d9') : '', txt(px0 - 4, Y(v) + 3.5, tickText(v), { anchor: 'end' }))
+        for (const v of xt) out.push(grid ? line(X(v), py0, X(v), py1, '#ececec') : '', txt(X(v), py1 + 12, tickText(v)))
+        pts.forEach((ps, si) => { for (const [a, b] of ps) if (b >= yt[0] && b <= yt[yt.length - 1]) out.push(`<circle cx="${f1(X(a))}" cy="${f1(Y(b))}" r="3.5" fill="#${series[si].color}"/>`, ch.labels ? txt(X(a), Y(b) - 6, label(b, a)) : '') })
         return svg()
       }
       // Category charts: columns, bars, lines and areas.
@@ -1478,7 +1524,7 @@ window.__ModuleLoader__.load({
         }
         if (pct) { hi = 1; lo = sums.some((x) => x[1] < 0) ? -1 : 0 }
       } else for (const x of series) for (const v of x.vals) { const y = num(v); if (y !== null) { hi = Math.max(hi, y); lo = Math.min(lo, y) } }
-      const ticks = niceTicks(lo, hi)
+      const ticks = valTicks(lo, hi)
       const tlo = ticks[0]; const thi = ticks[ticks.length - 1]
       const fmt = (v) => (pct ? Math.round(v * 100) + '%' : tickText(v))
       const horiz = ch.type === 'bar'
@@ -1488,9 +1534,9 @@ window.__ModuleLoader__.load({
       const vpos = (v) => { v = Math.max(tlo, Math.min(thi, v)); return horiz ? px0 + (v - tlo) / (thi - tlo) * (px1 - px0) : py1 - (v - tlo) / (thi - tlo) * (py1 - py0) }
       for (const v of ticks) {
         const p = vpos(v)
-        out.push(horiz ? line(p, py0, p, py1, '#d9d9d9') + txt(p, py1 + 11, fmt(v)) : line(px0, p, px1, p, '#d9d9d9') + txt(px0 - 4, p + 3.5, fmt(v), { anchor: 'end' }))
+        out.push(horiz ? (grid ? line(p, py0, p, py1, '#d9d9d9') : '') + txt(p, py1 + 11, fmt(v)) : (grid ? line(px0, p, px1, p, '#d9d9d9') : '') + txt(px0 - 4, p + 3.5, fmt(v), { anchor: 'end' }))
       }
-      const zero = vpos(0)
+      const zero = vpos(Math.max(tlo, Math.min(thi, 0)))
       out.push(horiz ? line(zero, py0, zero, py1, '#bfbfbf') : line(px0, zero, px1, zero, '#bfbfbf'))
       const len = horiz ? py1 - py0 : px1 - px0
       const band = len / n
@@ -1514,6 +1560,12 @@ window.__ModuleLoader__.load({
           const s0 = (horiz ? py0 : px0) + band * i + b * 0.75 + (ch.stacked ? 0 : si) * b
           const p1 = vpos(a); const p2 = vpos(e)
           out.push(horiz ? box(Math.min(p1, p2), s0, Math.abs(p2 - p1), b, x.color) : box(s0, Math.min(p1, p2), b, Math.abs(p2 - p1), x.color))
+          if (ch.labels) {
+            const s = label(num(v0), labels[i])
+            // Stacked pieces carry their label inside, the rest past the end.
+            if (ch.stacked) out.push(horiz ? txt((p1 + p2) / 2, s0 + b / 2 + 3.5, s, { fill: '#fff', size: 9 }) : txt(s0 + b / 2, (p1 + p2) / 2 + 3.5, s, { fill: '#fff', size: 9 }))
+            else out.push(horiz ? txt(v >= 0 ? Math.max(p1, p2) + 3 : Math.min(p1, p2) - 3, s0 + b / 2 + 3.5, s, { anchor: v >= 0 ? 'start' : 'end', size: 9 }) : txt(s0 + b / 2, v >= 0 ? Math.min(p1, p2) - 3 : Math.max(p1, p2) + 10, s, { size: 9 }))
+          }
         }))
         return svg()
       }
@@ -1532,12 +1584,14 @@ window.__ModuleLoader__.load({
           const ptsBase = t.map((_, i) => `${f1(centre(i))},${f1(vpos(base ? base[i] ?? 0 : 0))}`).reverse()
           out.push(`<polygon points="${[...ptsTop, ...ptsBase].join(' ')}" fill="#${series[si].color}" fill-opacity="${ch.stacked ? 1 : 0.8}"/>`)
         })
+        if (ch.labels) tops.forEach((t, si) => t.forEach((v, i) => { if (v !== null) out.push(txt(centre(i), vpos(v) - 5, label(num(series[si].vals[i]), labels[i]), { size: 9 })) }))
         return svg()
       }
       tops.forEach((t, si) => {
         let d = ''
         t.forEach((v, i) => { if (v === null) return; d += `${d && t[i - 1] !== null ? 'L' : 'M'}${f1(centre(i))} ${f1(vpos(v))}` })
         out.push(`<path d="${d}" fill="none" stroke="#${series[si].color}" stroke-width="2.25" stroke-linejoin="round" stroke-linecap="round"/>`)
+        if (ch.labels) t.forEach((v, i) => { if (v !== null) out.push(txt(centre(i), vpos(v) - 6, label(num(series[si].vals[i]), labels[i]), { size: 9 })) })
       })
       return svg()
     }
@@ -3225,6 +3279,7 @@ window.__ModuleLoader__.load({
           '-',
           { label: ch.stacked ? '取消堆积' : '堆积', disabled: ro || !ch.editable || !stackable, fn: () => this.chartOp(ch, { op: 'chart_edit', stacked: ch.stacked ? null : 'stacked' }) },
           { label: '编辑标题…', disabled: ro, fn: () => this.chartTitle(ch) },
+          { label: '图表选项…', disabled: ro, fn: () => this.chartOptions(ch) },
           { label: '删除图表', kbd: 'Delete', disabled: ro, fn: () => this.deleteChart(ch) }
         ])
       }
@@ -3234,6 +3289,36 @@ window.__ModuleLoader__.load({
         const t = window.prompt('图表标题（留空则不显示）', ch.title ?? '')
         if (t === null || t === (ch.title ?? '')) return
         this.chartOp(ch, { op: 'chart_edit', title: t })
+      }
+
+      // chartOptions sets data labels, the legend, axis titles, the value
+      // axis bounds and gridlines in one dialog.
+      async chartOptions (ch) {
+        if (!this.doc.writable || this.chartBusy) return
+        const pie = ch.type === 'pie' || ch.type === 'doughnut'
+        const axis = () => !pie
+        const v = await dialog({
+          title: '图表选项',
+          fields: [
+            { key: 'labels', label: '数据标签', type: 'select', value: ch.labels ?? 'none', options: [['none', '无'], ['value', '值'], ...(pie ? [['percent', '百分比']] : []), ['category', '类别名称']] },
+            { key: 'legend', label: '图例', type: 'select', value: ch.legend ?? 'none', options: [['none', '无'], ['r', '右侧'], ['b', '底部'], ['t', '顶部'], ['l', '左侧'], ['tr', '右上']] },
+            { key: 'x_title', label: ch.type === 'scatter' ? 'X 轴标题' : '类别轴标题', value: ch.xTitle ?? '', placeholder: '留空则不显示', show: axis },
+            { key: 'y_title', label: ch.type === 'scatter' ? 'Y 轴标题' : '数值轴标题', value: ch.yTitle ?? '', placeholder: '留空则不显示', show: axis },
+            { key: 'y_min', label: '数值轴最小值', value: ch.yMin ?? '', placeholder: '自动', show: axis },
+            { key: 'y_max', label: '数值轴最大值', value: ch.yMax ?? '', placeholder: '自动', show: axis },
+            { key: 'gridlines', label: '主要网格线', type: 'checkbox', value: ch.gridlines !== false, show: axis }
+          ],
+          check: (x) => {
+            if (pie) return ''
+            for (const k of ['y_min', 'y_max']) if (x[k].trim() !== '' && !Number.isFinite(+x[k])) return '最小值、最大值要填数字或留空'
+            if (x.y_min.trim() !== '' && x.y_max.trim() !== '' && +x.y_min >= +x.y_max) return '最小值要小于最大值'
+            return ''
+          }
+        })
+        if (!v) { this.focus(); return }
+        const op = { op: 'chart_edit', labels: v.labels, legend: v.legend }
+        if (!pie) Object.assign(op, { x_title: v.x_title, y_title: v.y_title, y_min: v.y_min.trim() === '' ? null : +v.y_min, y_max: v.y_max.trim() === '' ? null : +v.y_max, gridlines: v.gridlines })
+        this.chartOp(ch, op)
       }
 
       deleteChart (ch) {
@@ -4296,7 +4381,7 @@ window.__ModuleLoader__.load({
           const cm = e.target.closest?.('.qd-cm')
           if (cm) { this.paneOpen = true; this.activate(cm.dataset.id) }
           const toc = e.target.closest?.('.qd-p[data-toc]')
-          if (toc && +toc.dataset.toc > 0) this.jumpToHeading(toc.textContent)
+          if (toc && +toc.dataset.toc > 0) this.jumpToHeading(toc.textContent.replace(/\t[\s\S]*$/, ''))
           const fn = e.target.closest?.('.qd-fn')
           if (fn) { const box = this.notesBox.querySelector(`[data-note="${fn.dataset.note}"][data-id="${fn.dataset.id}"] .qd-note-t`); if (box) { box.scrollIntoView({ block: 'center' }); box.focus() } }
           if (e.target.tagName === 'IMG' && e.target.classList.contains('qd-img')) this.pickImg(e.target); else this.dropImg()
@@ -4414,6 +4499,12 @@ window.__ModuleLoader__.load({
           else if (r.t === 'cs' || r.t === 'ce' || r.t === 'cr') d.append(this.marker(r.t[1], r.id))
         }
         if (!d.childNodes.length) d.append(el('br'))
+        // A contents entry with a page number: the tab before it is a
+        // dotted leader.
+        if (b.toc > 0) {
+          const tab = [...d.querySelectorAll(':scope > .qd-r')].reverse().find((x) => x.textContent === '\t')
+          if (tab) { tab.classList.add('qd-leader'); d.classList.add('qd-tocp') }
+        }
         this.dress(d)
         return d
       }
@@ -4913,6 +5004,12 @@ window.__ModuleLoader__.load({
           const pending = this.touched
           this.load(model, { keep: true })
           if (pending) this.frame.toast('文档结构已变化，刚才保存期间的少量输入可能需要重做。', 'warn')
+          // A new contents moves the headings after it: count again once
+          // the pages settle.
+          if (this.tocCheck) {
+            this.tocCheck = false
+            setTimeout(() => { if (this.model.toc && this.tocDrift()) this.tocOp({ op: 'toc_update' }) }, 400)
+          }
           return
         }
         this.model = model
@@ -5138,6 +5235,8 @@ window.__ModuleLoader__.load({
         const html = e.clipboardData.getData('text/html')
         const range = currentRange(this.page)
         if (html && range && !this.cellOf(range.startContainer)) {
+          const t = htmlTable(html)
+          if (t) { this.pasteTable(t); return }
           const paras = parseHtml(html)
           if (paras.length) { this.pasteParas(paras); return }
         }
@@ -5345,6 +5444,11 @@ window.__ModuleLoader__.load({
       }
 
       insertTable () { this.structural((b) => ({ op: 'table', after: b.ref, rows: 3, cols: 3 })) }
+      // pasteTable puts a pasted table after the block with the caret.
+      pasteTable (t) {
+        const cols = Math.max(...t.rows.map((r) => r.length))
+        this.structural((b) => ({ op: 'table', after: b.ref, rows: t.rows.length, cols, cells: t.rows, header: t.header }))
+      }
       tableRow (action) {
         this.structural((b, cell) => {
           if (b.kind !== 't' || !cell) { this.frame.toast('请先把光标放在表格的单元格里。', 'info'); return undefined }
@@ -6388,14 +6492,39 @@ window.__ModuleLoader__.load({
       // or at the top of the document.
       insertToc () {
         const range = currentRange(this.page)
-        this.structural((b) => ({ op: 'toc', before: b.ref, levels: 3 }), range ? this.spot() : { node: this.page.firstElementChild })
+        this.tocCheck = true
+        this.structural((b) => ({ op: 'toc', before: b.ref, levels: 3, pages: this.headingPages() }), range ? this.spot() : { node: this.page.firstElementChild })
       }
 
       async tocOp (op) {
         if (!this.doc.writable) return
         await this.doc.flush()
-        this.struct.push(() => op)
+        this.struct.push(() => (op.op === 'toc_update' ? { ...op, pages: this.headingPages() } : op))
         this.doc.dirty(true)
+      }
+
+      // headingPages gives the page each saved heading is laid out on,
+      // keyed by block ref, for the contents' page numbers.
+      headingPages () {
+        const pg = this.model?.page
+        if (!pg) return undefined
+        const k = this.page.offsetWidth / pg.width || 1
+        const per = pg.cols > 1 ? Math.max(100, pg.height - pg.top - pg.bottom) : pg.height + 16
+        const out = {}
+        for (const b of this.page.children) {
+          const ref = this.headingLevel(b) && this.base.get(b.dataset.k)?.ref
+          if (ref) out[ref] = Math.floor(b.offsetTop / k / per) + 1
+        }
+        return out
+      }
+
+      // tocDrift is true when the contents' page numbers disagree with
+      // where the headings now sit (a new contents pushes them down).
+      tocDrift () {
+        const shown = [...this.page.querySelectorAll('.qd-tocp')].map((p) => +p.textContent.split('\t').pop())
+        const pages = this.headingPages() ?? {}
+        const want = [...this.page.children].filter((b) => { const l = this.headingLevel(b); return l && l <= 3 && this.base.get(b.dataset.k) }).map((b) => pages[this.base.get(b.dataset.k).ref])
+        return shown.length > 0 && shown.length === want.length && shown.some((n, i) => n !== want[i])
       }
 
       // ------------------------------------------------ navigation pane
@@ -6701,9 +6830,22 @@ window.__ModuleLoader__.load({
 
     // ---------------------------------------------------------- presentation
 
-    const ANIM_FX = [['none', '无'], ['appear', '出现'], ['fade', '淡入'], ['fly', '飞入'], ['wipe', '擦除'], ['zoom', '缩放']]
-    const ANIM_NAME = Object.fromEntries(ANIM_FX)
+    // Effect keys: entrance effects by name, the other classes as cls:name.
+    const ANIM_FX = [['none', '无'], ['appear', '进入 · 出现'], ['fade', '进入 · 淡入'], ['fly', '进入 · 飞入'], ['wipe', '进入 · 擦除'], ['zoom', '进入 · 缩放'],
+      ['emph:pulse', '强调 · 脉冲'], ['emph:grow', '强调 · 放大/缩小'], ['emph:spin', '强调 · 陀螺旋'], ['emph:transparency', '强调 · 透明'],
+      ['exit:appear', '退出 · 消失'], ['exit:fade', '退出 · 淡出'], ['exit:fly', '退出 · 飞出'], ['exit:wipe', '退出 · 擦除'], ['exit:zoom', '退出 · 缩放'],
+      ['path:line', '路径 · 直线']]
+    const ANIM_NAME = Object.fromEntries(ANIM_FX.map(([k, l]) => [k, l.replace(/^.+ · /, '')]))
+    const animKey = (a) => (a.cls && a.cls !== 'entr' ? `${a.cls}:${a.effect}` : a.effect)
+    const animOf = (key) => { const [c, e] = key.includes(':') ? key.split(':') : ['entr', key]; return { cls: c, effect: e } }
+    const animHasDir = (a) => a && (a.cls === 'path' || (a.cls !== 'emph' && ['fly', 'wipe'].includes(a.effect)))
     const ANIM_DIRS = [['b', '自底部'], ['t', '自顶部'], ['l', '自左侧'], ['r', '自右侧']]
+    const EXIT_DIRS = [['b', '到底部'], ['t', '到顶部'], ['l', '到左侧'], ['r', '到右侧']]
+    const PATH_DIRS = [['b', '向下'], ['t', '向上'], ['l', '向左'], ['r', '向右']]
+    // A shape starts hidden when its first effect is an entrance, and ends
+    // hidden when its last is an exit.
+    const animStartsHidden = (list, spid) => { const a = (list ?? []).find((x) => x.spid === spid); return !!a && (a.cls ?? 'entr') === 'entr' }
+    const animEndsHidden = (list, spid) => { const a = (list ?? []).filter((x) => x.spid === spid).pop(); return a?.cls === 'exit' }
     const ANIM_START = [['click', '单击时'], ['with', '与上一动画同时'], ['after', '上一动画之后']]
     const TRANS_FX = [['none', '无'], ['fade', '淡入淡出'], ['push', '推入'], ['wipe', '擦除'], ['split', '分割'], ['cover', '覆盖'], ['pull', '揭开'], ['zoom', '缩放'], ['dissolve', '溶解']]
     const TRANS_DIRS = [['l', '自右侧'], ['r', '自左侧'], ['u', '自底部'], ['d', '自顶部']]
@@ -6783,22 +6925,45 @@ window.__ModuleLoader__.load({
     }
     const animTargets = (root, spid) => root ? [...root.querySelectorAll(`[data-id="${spid}"],[data-gid="${spid}"]`)] : []
 
-    // runEffect plays one entrance effect on a shape of a slide.
+    // runEffect plays one effect on a shape of a slide: an entrance shows
+    // it, an exit hides it at the end, emphasis and paths hold where they
+    // finish.
     function runEffect (n, a, delay) {
-      const base = n.style.transform || ''
+      const base = n.dataset.base ?? (n.dataset.base = n.style.transform || '')
       const slide = n.closest('.slide')
+      const W = slide?.offsetWidth ?? 960; const H = slide?.offsetHeight ?? 540
+      const cls = a.cls ?? 'entr'
+      const d = a.dir ?? 'b'
       const dur = a.effect === 'appear' ? 1 : Math.max(50, a.dur || 500)
+      const ease = { easing: 'ease-in-out', delay, duration: dur, fill: 'both' }
+      if (cls === 'emph') {
+        const frames = a.effect === 'pulse' ? [{ transform: `${base} scale(1)` }, { transform: `${base} scale(1.05)` }, { transform: `${base} scale(1)` }]
+          : a.effect === 'grow' ? [{ transform: `${base} scale(1)` }, { transform: `${base} scale(1.5)` }]
+            : a.effect === 'spin' ? [{ transform: `${base} rotate(0deg)` }, { transform: `${base} rotate(360deg)` }]
+              : [{ opacity: 1 }, { opacity: 0.5 }]
+        return n.animate(frames, { ...ease, composite: 'replace' })
+      }
+      if (cls === 'path') {
+        const v = { b: [0, H / 4], t: [0, -H / 4], r: [W / 4, 0], l: [-W / 4, 0] }[d] ?? [0, H / 4]
+        return n.animate([{ transform: `translate(0px,0px) ${base}` }, { transform: `translate(${v[0]}px,${v[1]}px) ${base}` }], ease)
+      }
       let frames = [{ opacity: 0 }, { opacity: 1 }]
       if (a.effect === 'fly') {
-        const W = slide?.offsetWidth ?? 960; const H = slide?.offsetHeight ?? 540
-        const d = a.dir ?? 'b'
         const dx = d === 'l' ? -(n.offsetLeft + n.offsetWidth) : d === 'r' ? W - n.offsetLeft : 0
         const dy = d === 't' ? -(n.offsetTop + n.offsetHeight) : d === 'b' ? H - n.offsetTop : 0
         frames = [{ transform: `translate(${dx}px,${dy}px) ${base}` }, { transform: `translate(0px,0px) ${base}` }]
       } else if (a.effect === 'wipe') {
-        const from = { b: 'inset(100% 0 0 0)', t: 'inset(0 0 100% 0)', l: 'inset(0 100% 0 0)', r: 'inset(0 0 0 100%)' }[a.dir ?? 'b']
+        const edge = { b: 'inset(100% 0 0 0)', t: 'inset(0 0 100% 0)', l: 'inset(0 100% 0 0)', r: 'inset(0 0 0 100%)' }
+        // An exit wipes away toward its edge.
+        const from = cls === 'exit' ? { b: edge.t, t: edge.b, l: edge.r, r: edge.l }[d] : edge[d]
         frames = [{ clipPath: from }, { clipPath: 'inset(0 0 0 0)' }]
       } else if (a.effect === 'zoom') frames = [{ transform: `${base} scale(.1)`, opacity: 0 }, { transform: `${base} scale(1)`, opacity: 1 }]
+      else if (a.effect === 'appear') frames = [{ opacity: 1 }, { opacity: 1 }]
+      if (cls === 'exit') {
+        const x = n.animate(frames.reverse(), { duration: dur, delay, fill: 'forwards', easing: a.effect === 'fly' ? 'cubic-bezier(.7,0,.8,.3)' : 'ease-in' })
+        x.finished.then(() => { n.style.visibility = 'hidden'; x.cancel() }, () => {})
+        return x
+      }
       n.style.visibility = 'visible'
       return n.animate(frames, { duration: dur, delay, fill: 'backwards', easing: a.effect === 'fly' ? 'cubic-bezier(.2,.7,.3,1)' : 'ease-out' })
     }
@@ -6922,7 +7087,7 @@ window.__ModuleLoader__.load({
         this.ui.transAll = tb.button('全部应用', '把当前幻灯片的切换效果应用到所有幻灯片', () => this.setTransition({}, true))
         this.ui.transPrev = tb.button('预览', '预览切换效果', () => this.previewTransition(), { ico: 'play' })
         tb.tab('动画')
-        this.ui.anim = tb.select('动画效果', ANIM_FX.map(([v, l]) => ({ value: v, label: l })), (v) => this.setAnim({ effect: v }), { width: '64px' })
+        this.ui.anim = tb.select('动画效果', ANIM_FX.map(([v, l]) => ({ value: v, label: l })), (v) => this.setAnim(v === 'none' ? { effect: 'none' } : animOf(v)), { width: '112px' })
         this.ui.animDir = tb.select('效果选项', ANIM_DIRS.map(([v, l]) => ({ value: v, label: l })), (v) => this.setAnim({ dir: v }), { width: '72px' })
         this.ui.animStart = tb.select('开始', ANIM_START.map(([v, l]) => ({ value: v, label: l })), (v) => this.setAnim({ start: v }), { width: '110px' })
         this.ui.animDur = tb.select('持续时间', [250, 500, 750, 1000, 1500, 2000, 3000].map((v) => ({ value: String(v), label: v / 1000 + ' 秒' })), (v) => this.setAnim({ dur: +v }), { width: '66px' })
@@ -7561,12 +7726,14 @@ window.__ModuleLoader__.load({
         const n = this.target(e)
         if (!n || !this.doc.writable) return
         if (n.dataset.t === 'tbl') { const td = e.target.closest?.('td[data-r]'); if (td && n.contains(td)) this.editCell(n, td); return }
+        // A SmartArt node's text is edited in place, like a text box.
+        if (n.dataset.saFrame) { const sa = e.target.closest?.('[data-sa]'); if (sa && n.contains(sa)) this.beginEdit(sa, e); return }
         this.beginEdit(n, e)
       }
 
       beginEdit (n, e) {
-        if (n.dataset.t !== 'txt' || this.editing) return
-        this.select(n.dataset.k)
+        if ((n.dataset.t !== 'txt' && !n.dataset.sa) || this.editing) return
+        this.select(n.dataset.k ?? n.closest('[data-k]').dataset.k)
         if (!n.querySelector('p')) n.append(el('p', {}, ZW))
         for (const b of n.querySelectorAll('.bu')) b.contentEditable = 'false'
         this.editing = { node: n, before: JSON.stringify(this.paras(n)) }
@@ -7598,7 +7765,9 @@ window.__ModuleLoader__.load({
         n.removeEventListener('paste', this.onPaste)
         window.getSelection()?.removeAllRanges()
         const paras = this.paras(n)
-        if (save && JSON.stringify(paras) !== ed.before && n.isConnected) {
+        if (save && JSON.stringify(paras) !== ed.before && n.isConnected && n.dataset.sa) {
+          this.push({ op: 'smart_text', ...this.at(), shape: +n.closest('[data-k]').dataset.k, node: n.dataset.sa, paras }, { quiet: true })
+        } else if (save && JSON.stringify(paras) !== ed.before && n.isConnected) {
           const empty = paras.every((p) => !p.runs.some((r) => r.text))
           n.toggleAttribute('data-empty', empty)
           n.toggleAttribute('data-filled', !empty)
@@ -7825,10 +7994,12 @@ window.__ModuleLoader__.load({
         this.ui.transPrev.disabled = master || !known || t.type === 'none'
         const a = this.curAnim()
         const can = !ro && !master && !sl?.animLocked && !!this.multi.length
-        this.ui.anim.value = a?.effect ?? 'none'
+        this.ui.anim.value = a ? animKey(a) : 'none'
         this.ui.anim.disabled = !can
+        const adirs = a?.cls === 'exit' ? EXIT_DIRS : a?.cls === 'path' ? PATH_DIRS : ANIM_DIRS
+        this.ui.animDir.querySelectorAll('option').forEach((o, i) => { o.textContent = adirs[i]?.[1] ?? o.textContent })
         this.ui.animDir.value = a?.dir ?? 'b'
-        this.ui.animDir.disabled = !can || !a || !['fly', 'wipe'].includes(a.effect)
+        this.ui.animDir.disabled = !can || !animHasDir(a)
         this.ui.animStart.value = a?.start ?? 'click'
         this.ui.animDur.value = String(a?.dur ?? 500)
         if (a && this.ui.animDur.value !== String(a.dur)) { this.ui.animDur.append(el('option', { value: String(a.dur) }, a.dur / 1000 + ' 秒')); this.ui.animDur.value = String(a.dur) }
@@ -8262,27 +8433,27 @@ window.__ModuleLoader__.load({
       setAnim (patch) {
         if (this.mode === 'master' || !this.doc.writable) return
         const sl = this.slide()
-        if (sl.animLocked) { this.frame.toast('这张幻灯片含有本编辑器不支持的动画（强调、退出、路径或触发器），请在 PowerPoint 中修改。', 'warn'); this.refreshMotion(); return }
+        if (sl.animLocked) { this.frame.toast('这张幻灯片含有本编辑器不支持的动画（触发器或曲线路径等），请在 PowerPoint 中修改。', 'warn'); this.refreshMotion(); return }
         const list = (sl.anims ?? []).map((a) => ({ ...a }))
         const spids = this.multi.map((k) => this.spidOf(k)).filter(Boolean)
         if (!spids.length && this.animSel === undefined) { this.frame.toast('先选中要添加动画的形状。', 'info'); this.refreshMotion(); return }
         const picked = this.animSel !== undefined && list[this.animSel] ? [this.animSel] : list.map((a, i) => (spids.includes(a.spid) ? i : -1)).filter((i) => i >= 0)
         let next = list
         if (patch.effect === 'none') { next = list.filter((a, i) => !picked.includes(i)); this.animSel = undefined } else if (patch.effect && !picked.length) {
-          for (const spid of spids) next.push({ spid, effect: patch.effect, start: 'click', dur: patch.effect === 'appear' ? 500 : 500, dir: 'b' })
+          for (const spid of spids) next.push({ spid, cls: patch.cls, effect: patch.effect, start: 'click', dur: patch.cls === 'emph' && patch.effect !== 'pulse' ? 1000 : patch.cls === 'path' ? 2000 : 500, dir: 'b' })
         } else if (!picked.length) { this.frame.toast('先为所选形状选择一种动画效果。', 'info'); this.refreshMotion(); return } else for (const i of picked) Object.assign(next[i], patch)
         this.pushAnims(next)
       }
 
       pushAnims (list) {
         this.keepMulti = [...this.multi]
-        this.push({ op: 'animations', slide: this.slide().n, list: list.map(({ spid, effect, start, dur, dir }) => ({ spid, effect, start, dur, ...(dir ? { dir } : {}) })) })
+        this.push({ op: 'animations', slide: this.slide().n, list: list.map(({ spid, cls, effect, start, dur, dir }) => ({ spid, ...(cls && cls !== 'entr' ? { cls } : {}), effect, start, dur, ...(dir ? { dir } : {}) })) })
       }
 
       moveAnim (d) {
         const list = (this.slide()?.anims ?? []).map((a) => ({ ...a }))
         const a = this.curAnim()
-        const i = list.findIndex((x) => x.spid === a?.spid && x.effect === a?.effect && x.start === a?.start && x.dur === a?.dur)
+        const i = list.findIndex((x) => x.spid === a?.spid && animKey(x) === (a && animKey(a)) && x.start === a?.start && x.dur === a?.dur)
         const j = i + d
         if (i < 0 || j < 0 || j >= list.length) return
         ;[list[i], list[j]] = [list[j], list[i]]
@@ -8330,7 +8501,7 @@ window.__ModuleLoader__.load({
           const name = n ? (n.dataset.t === 'pic' ? '图片' : (n.innerText || '').replace(/\u200b/g, '').trim().slice(0, 14) || (n.dataset.gid === a.spid ? '组合' : '形状')) : `形状 ${a.spid}`
           const row = el('div', { class: 'qp-arow' + (i === this.animSel ? ' on' : '') },
             el('b', {}, a.start === 'click' ? lab.get(a) : a.start === 'with' ? '↔' : '↳'),
-            el('span', { class: 'qp-afx' }, ANIM_NAME[a.effect] ?? a.effect),
+            el('span', { class: 'qp-afx', dataset: { cls: a.cls ?? 'entr' } }, ANIM_NAME[animKey(a)] ?? a.effect),
             el('span', { class: 'qp-aname' }, name))
           const del = el('button', { type: 'button', title: '删除此动画' }, '✕')
           del.addEventListener('click', (ev) => { ev.stopPropagation(); if (sl.animLocked || !this.doc.writable) return; this.animSel = undefined; this.pushAnims((sl.anims ?? []).filter((x, j) => j !== i)) })
@@ -8354,14 +8525,15 @@ window.__ModuleLoader__.load({
         if (this.editing) this.endEdit(true)
         const root = this.slideEl
         const touched = new Set()
-        for (const a of sl.anims) for (const n of animTargets(root, a.spid)) { n.style.visibility = 'hidden'; touched.add(n) }
+        for (const a of sl.anims) for (const n of animTargets(root, a.spid)) { if (animStartsHidden(sl.anims, a.spid)) n.style.visibility = 'hidden'; touched.add(n) }
         let at = 300
         for (const g of animGroups(sl.anims)) {
           const start = at
           setTimeout(() => { for (const st of g.steps) for (const a of st.items) for (const n of animTargets(root, a.spid)) runEffect(n, a, st.at) }, start)
           at = start + g.end + 400
         }
-        setTimeout(() => { for (const n of touched) n.style.visibility = '' }, at)
+        // Back to the slide as edited: shown, held effects let go.
+        setTimeout(() => { for (const n of touched) { for (const x of n.getAnimations()) x.cancel(); n.style.visibility = '' } }, at + 600)
       }
 
       arrange (v) {
@@ -8449,6 +8621,24 @@ window.__ModuleLoader__.load({
       }
 
       // ------------------------------------------------ table cells
+
+      // tableItems are the row and column entries of a table's menu, for
+      // the cell under the pointer.
+      tableItems (n, e, ro) {
+        const td = n.dataset.t === 'tbl' && e.target.closest?.('td[data-r]')
+        if (!td || !n.contains(td)) return []
+        const r = +td.dataset.r; const c = +td.dataset.c
+        const trs = [...n.querySelectorAll('tr')]
+        const cols = Math.max(...trs.map((tr) => [...tr.children].reduce((a, x) => a + (x.colSpan || 1), 0)))
+        const go = (axis, at, count) => () => { this.renderAfter = true; this.selectAfter = n.dataset.k; this.push({ op: 'table_lines', ...this.at(), shape: +n.dataset.k, axis, at, count }) }
+        return ['-',
+          { label: '在上方插入行', disabled: ro, fn: go('r', r, 1) },
+          { label: '在下方插入行', disabled: ro, fn: go('r', r + td.rowSpan, 1) },
+          { label: '在左侧插入列', disabled: ro, fn: go('c', c, 1) },
+          { label: '在右侧插入列', disabled: ro, fn: go('c', c + td.colSpan, 1) },
+          { label: '删除行', disabled: ro || trs.length < 2, fn: go('r', r, -1) },
+          { label: '删除列', disabled: ro || cols < 2, fn: go('c', c, -1) }]
+      }
 
       editCell (n, td) {
         if (!this.doc.writable) return
@@ -8545,13 +8735,21 @@ window.__ModuleLoader__.load({
           for (const x of n.querySelectorAll('[data-prompt]:not([data-filled])')) { if (x.dataset.ph) x.remove(); else x.removeAttribute('data-prompt') }
           return n
         }
+        // Without a second window the presenter can show the audience view
+        // here, full screen, and switch back.
+        const solo = (on) => { ov.classList.toggle('qp-solo', on); requestAnimationFrame(fit); ov.focus() }
+        if (presenter) {
+          const back = el('button', { type: 'button', class: 'qp-solo-back', title: '回到带备注和计时的演示者视图' }, '演示者视图')
+          back.addEventListener('click', (ev) => { ev.stopPropagation(); solo(false) })
+          ov.append(back)
+        }
         const audFrame = () => aud && !aud.closed ? aud.document.querySelector('.qp-frame') : null
         const fitAud = () => { const f = audFrame(); if (f) fitIn(aud.document.body, f) }
         const syncAud = () => { const f = audFrame(); if (!f) return; f.replaceChildren(); if (cur) f.append(aud.document.importNode(cur, true)); fitAud() }
         const openAud = () => {
           if (aud && !aud.closed) { aud.focus(); return }
           aud = window.open('', 'quire-audience', 'width=1280,height=760')
-          if (!aud) { this.frame.toast('浏览器拦截了弹出窗口，请允许后再试。', 'warn'); return }
+          if (!aud) { solo(true); this.frame.toast('浏览器拦截了弹出窗口：已改在本窗口全屏显示幻灯片（观众看到的画面），点右下角「演示者视图」切回。', 'warn'); return }
           const css = document.getElementById('quire-pptx-css')?.textContent ?? ''
           aud.document.open()
           aud.document.write(`<!doctype html><html><head><meta charset="utf-8"><title>放映</title><style>html,body{margin:0;width:100%;height:100%;background:#000;overflow:hidden}.qp{position:fixed;inset:0}.qp-frame{position:absolute;left:0;top:0;transform-origin:0 0;overflow:hidden}.qp-frame>.slide{position:absolute;left:0;top:0;box-shadow:none}${css}</style></head><body><div class="qp"><div class="qp-frame"></div></div></body></html>`)
@@ -8591,7 +8789,7 @@ window.__ModuleLoader__.load({
           const n = make(sl)
           groups = animGroups(sl.anims)
           step = built ? groups.length : 0
-          if (!built) for (const a of sl.anims ?? []) for (const x of animTargets(n, a.spid)) x.style.visibility = 'hidden'
+          for (const a of sl.anims ?? []) if (built ? animEndsHidden(sl.anims, a.spid) : animStartsHidden(sl.anims, a.spid)) for (const x of animTargets(n, a.spid)) x.style.visibility = 'hidden'
           const old = cur
           const t = sl.transition
           frame.append(n)
@@ -8665,6 +8863,7 @@ window.__ModuleLoader__.load({
           n.dataset.t === 'txt' && this.selected === n.dataset.k ? { label: '编辑文字', kbd: '⏎', disabled: ro, fn: () => this.beginEdit(n) } : null,
           n.dataset.t === 'txt' && this.selected === n.dataset.k ? { label: '文本框选项…', disabled: ro, fn: () => this.bodyDialog() } : null,
           n.dataset.t === 'pic' ? { label: '裁剪', disabled: ro, fn: () => this.startCrop() } : null,
+          ...this.tableItems(n, e, ro),
           this.multi.length > 1 ? { label: '组合', kbd: '⌘G', disabled: ro, fn: () => this.group() } : null,
           String(key).startsWith('g') ? { label: '取消组合', kbd: '⇧⌘G', disabled: ro, fn: () => this.ungroup() } : null,
           '-',
@@ -9344,6 +9543,8 @@ window.__ModuleLoader__.load({
 .qd-p[data-toc="0"]{cursor:default;font-weight:700;font-size:1.2em}
 .qd-p[data-toc="2"]{padding-left:24px}
 .qd-p[data-toc="3"]{padding-left:48px}
+.qd-p.qd-tocp{display:flex;align-items:baseline}
+.qd-tocp>.qd-leader{flex:1;min-width:1.5em;margin:0 .35em;color:transparent;border-bottom:1.5px dotted #777;transform:translateY(-.25em)}
 .qd-cpane{width:270px;min-width:220px;max-width:40%;border-left:1px solid var(--q-b1);background:var(--q-l1);overflow-y:auto;display:flex;flex-direction:column;gap:8px;padding:8px;font-size:12px;color:var(--q-t1)}
 .qd-cpane[hidden]{display:none}
 .qd-chead{display:flex;align-items:center;gap:6px}
@@ -9450,6 +9651,10 @@ window.__ModuleLoader__.load({
 .qp.qp-show.qp-presenter{display:flex;cursor:default}
 .qp-screen{position:absolute;inset:0;overflow:hidden}
 .qp-presenter .qp-screen{position:relative;flex:1}
+.qp-solo-back{display:none}
+.qp-presenter.qp-solo .qp-pv{display:none}
+.qp-presenter.qp-solo .qp-solo-back{display:block;position:absolute;right:14px;bottom:14px;z-index:2;opacity:.25;background:#333;color:#eee;border:1px solid #555;border-radius:4px;padding:5px 10px;font:12px -apple-system,"PingFang SC",sans-serif;cursor:pointer}
+.qp-presenter.qp-solo .qp-solo-back:hover{opacity:1}
 .qp-frame{position:absolute;left:0;top:0;transform-origin:0 0;overflow:hidden}
 .qp-frame>.slide{position:absolute;left:0;top:0;box-shadow:none}
 .qp-pv{width:320px;flex:none;background:#1e1e1e;color:#ddd;display:flex;flex-direction:column;gap:8px;padding:12px;font:13px -apple-system,"PingFang SC",sans-serif;overflow:auto;box-sizing:border-box}

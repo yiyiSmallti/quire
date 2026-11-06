@@ -315,10 +315,10 @@ const contentText = (v) => typeof v === 'string' ? v : Array.isArray(v) ? v.map(
 
 // startModel serves the Anthropic Messages API dsh's DeepSeek adapter
 // uses: it calls the scripted tools in order, one per request, then answers
-// with text. It records each tool_result it receives, the tools it was
+// with text (reply). It records each tool_result it receives, the tools it was
 // offered, the system prompt, and the text and images of the latest request.
-export async function startModel (cleanup, script = []) {
-  const m = { url: '', script, results: [], tools: [], system: '', prompt: '', images: 0 }
+export async function startModel (cleanup, script = [], reply = 'done') {
+  const m = { url: '', script, reply, results: [], tools: [], system: '', prompt: '', images: 0 }
   const server = http.createServer((req, res) => {
     let body = ''
     req.setEncoding('utf8')
@@ -379,7 +379,7 @@ function serve (m, req, res, body) {
     stop = 'tool_use'
   } else {
     ev('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })
-    ev('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'done' } })
+    ev('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: m.reply } })
   }
   ev('content_block_stop', { type: 'content_block_stop', index: 0 })
   ev('message_delta', { type: 'message_delta', delta: { stop_reason: stop }, usage: { output_tokens: 5 } })

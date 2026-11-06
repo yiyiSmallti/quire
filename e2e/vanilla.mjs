@@ -7,7 +7,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { chromePath } from './chrome.mjs'
 import {
-  Cleanup, Dsh, REPORT, check, chart, clip, findDsh, goList, keep, packPlugin,
+  Cleanup, Dsh, E2E, REPORT, ROOT, check, chart, clip, findDsh, goList, keep, packPlugin,
   quireTools, run, shortTemp, startModel, tail, unzip, which
 } from './harness.mjs'
 
@@ -106,6 +106,9 @@ async function suite (s, cleanup) {
   try {
     chart(path.join(ws, 'chart.png'))
     fs.writeFileSync(path.join(ws, 'notes.txt'), '不是 Office 文件\n')
+    const lib = path.join(ROOT, 'plugin', 'lib')
+    await run({}, work, process.execPath, [path.join(E2E, 'gen', 'review.mjs'), lib, path.join(ws, 'review.docx')])
+    await run({}, work, process.execPath, [path.join(E2E, 'gen', 'smartart.mjs'), lib, path.join(ws, 'flow.pptx')])
     if (which('textutil')) {
       const htmlPath = path.join(work, 'legacy.html')
       fs.writeFileSync(htmlPath, legacyHTML)
@@ -114,7 +117,7 @@ async function suite (s, cleanup) {
     }
   } catch (e) { err = e }
   const legacyBefore = fs.existsSync(legacy) ? fs.readFileSync(legacy) : Buffer.alloc(0)
-  if (!s.step('准备工作区：图表图片、一个文本文件、一份别的程序（textutil）写的 .docx', err, `legacy.docx ${legacyBefore.length} 字节`)) return
+  if (!s.step('准备工作区：图表图片、一个文本文件、一份别的程序（textutil）写的 .docx、一份带别人修订的 .docx、一份带 SmartArt 和组合的 .pptx', err, `legacy.docx ${legacyBefore.length} 字节`)) return
 
   const script = [
     /* 0 */ call('docx_create', { file_path: 'report.docx', markdown: reportMD }),
@@ -184,7 +187,34 @@ async function suite (s, cleanup) {
     /* 13 */ call('office_preview', { file_path: 'report.docx' }),
     /* 14 */ call('xlsx_create', { file_path: '../outside.xlsx', sheets: [{ name: 'S', rows: [[1]] }] }),
     /* 15 */ call('office_read', { file_path: 'notes.txt' }),
-    /* 16 */ call('docx_edit', { file_path: 'report.docx', edits: [{ op: 'delete', blocks: ['p99'] }] })
+    /* 16 */ call('docx_edit', { file_path: 'report.docx', edits: [{ op: 'delete', blocks: ['p99'] }] }),
+    /* 17 */ call('xlsx_edit', {
+      file_path: 'budget.xlsx',
+      edits: [
+        { op: 'insert_rows', sheet: '明细', at: 3 },
+        { op: 'write', sheet: '明细', at: 'A3', rows: [['存储', 500, 4, '=B3*C3']] },
+        { op: 'add_chart', sheet: '明细', range: 'A1:B4', type: 'col', title: '单价对比', at: 'F2', labels: 'value', legend: 'none', y_title: '元' },
+        { op: 'edit_chart', sheet: '明细', chart: 1, type: 'bar', gridlines: false, y_min: 0 }
+      ]
+    }),
+    /* 18 */ call('office_read', { file_path: 'budget.xlsx', sheet: '明细' }),
+    /* 19 */ call('office_read', { file_path: 'budget.xlsx', sheet: '汇总' }),
+    /* 20 */ call('docx_edit', { file_path: 'report.docx', edits: [{ op: 'comment', block: 'p2', find: '120 万元', text: '数字请财务复核', author: '审阅人' }] }),
+    /* 21 */ call('docx_edit', { file_path: 'report.docx', edits: [{ op: 'reply', comment: 0, text: '已复核，无误' }, { op: 'resolve', comment: 0 }] }),
+    /* 22 */ call('office_read', { file_path: 'report.docx' }),
+    /* 23 */ call('office_read', { file_path: 'review.docx' }),
+    /* 24 */ call('docx_edit', { file_path: 'review.docx', edits: [{ op: 'accept', block: 'p2' }, { op: 'reject' }, { op: 'track', on: false }] }),
+    /* 25 */ call('office_read', { file_path: 'review.docx' }),
+    /* 26 */ call('office_read', { file_path: 'flow.pptx' }),
+    /* 27 */ call('pptx_edit', {
+      file_path: 'flow.pptx',
+      edits: [
+        { op: 'set_text', shape: 's1.2.4', text: '全量发布' },
+        { op: 'set_text', shape: 's1.2.1', text: '需求评审' },
+        { op: 'set_text', shape: 's3.3', text: '组合里改过的第二段' }
+      ]
+    }),
+    /* 28 */ call('office_read', { file_path: 'flow.pptx' })
   ]
   if (!haveTextutil) {
     script[11] = call('office_read', { file_path: 'report.docx' })
@@ -243,15 +273,52 @@ async function suite (s, cleanup) {
   fails(16, t[16].includes('no block p99') && t[16].includes('office_read'), 'docx_edit 编号不存在：报错并提示重新 office_read')
   const report = fs.readFileSync(path.join(ws, 'report.docx'))
   s.step('失败的编辑不动文件', check(report.includes('PK') && zipHas(report, 'word/document.xml'), 'report.docx broken'))
+  ok(17, t[17].includes('inserted 明细 row 3') && t[17].includes('added chart 1 on 明细 from A1:B4') && t[17].includes('edited chart 1'),
+    'xlsx_edit：插入一行、写入、按区域加图表（数据标签、图例、轴标题），再改成条形图')
+  ok(18, t[18].includes('chart 1: bar "单价对比"') && t[18].includes('labels value, legend none, y_title "元", y_min 0, no gridlines') &&
+    t[18].includes('| 3 | 存储 | 500 | 4 | =B3*C3 → 2000 |') && t[18].includes('| 4 | 带宽 | 1,200 | 12 | =B4*C4 → 14,400 |') &&
+    t[18].includes('=SUM(D2:D4) → 56,400'),
+  'office_read（Excel）：插入行后下面的公式跟着下移、合计范围扩大；图表和外观设置都列出来')
+  ok(19, t[19].includes('=明细!D5 → 56400') && t[19].includes('=AVERAGE(明细!B2:B4)'), 'office_read：别的表引用插入行下方的单元格，也跟着改')
+  ok(20, t[20].includes('Edited '), 'docx_edit：在一段里的「120 万元」上加批注')
+  ok(21, t[21].includes('Edited '), 'docx_edit：回复批注并标为已解决')
+  ok(22, t[22].includes('comment 0 by 审阅人 (resolved) on p2 "120 万元": 数字请财务复核') && t[22].includes('  - comment 1 by Agent: 已复核，无误') &&
+    t[22].includes('# 季度报告（终稿）'),
+  'office_read（Word）：批注、作者、锚定文字、回复和解决状态都列出来，正文不变')
+  ok(23, t[23].includes('4 tracked changes') && t[23].includes('change 1: deleted by 王芳 in p2 "三"') && t[23].includes('change 4: inserted by 李雷 in p3 "三"'),
+    'office_read（Word）：别人的修订按作者、段落、增删列出')
+  ok(24, t[24].includes('Edited '), 'docx_edit：接受 p2 的修订，拒绝其余的，关掉修订')
+  ok(25, t[25].includes('[p2] 付款期限为六十天。') && t[25].includes('[p3] 违约金按日万分之五计算。') &&
+    !t[25].includes('tracked changes') && !t[25].includes('track changes is on'),
+  'office_read 读回：接受的留下、拒绝的复原，文档里不再有修订')
+  ok(26, t[26].includes('[s1.2] SmartArt "流程图"') && t[26].includes('    - [s1.2.4] 灰度发布') && t[26].includes('组合里的第二段'),
+    'office_read（PowerPoint）：SmartArt 按节点层级列出，组合里的文本框也列出来')
+  ok(27, !t[27].includes('Error'), 'pptx_edit：改 SmartArt 的子节点、顶层节点和组合里的文本框')
+  ok(28, t[28].includes('[s1.2.1] 需求评审') && t[28].includes('    - [s1.2.4] 全量发布') && t[28].includes('组合里改过的第二段') &&
+    !t[28].includes('灰度发布'),
+  'office_read 读回：SmartArt 节点和组合文字都改了，层级不变')
+  let saErr = null
+  let saNote = ''
+  try {
+    const parts = new Map(unzip(fs.readFileSync(path.join(ws, 'flow.pptx'))).map((e) => [e.name, e.data().toString('utf8')]))
+    const data = parts.get('ppt/diagrams/data1.xml') ?? ''
+    const drawing = parts.get('ppt/diagrams/drawing1.xml') ?? ''
+    // PowerPoint shows the saved drawing until it re-lays the diagram out, so
+    // the text has to change there too, the child still an indented line.
+    saErr = check(data.includes('全量发布') && data.includes('需求评审') && drawing.includes('需求评审') &&
+      /<a:pPr[^>]*lvl="1"[^>]*\/?>(?:(?!<\/a:p>).)*全量发布/s.test(drawing) && !drawing.includes('灰度发布'), `drawing = ${clip(drawing, 400)}`)
+    saNote = 'data1.xml 与 drawing1.xml 都已更新'
+  } catch (e) { saErr = e }
+  s.step('SmartArt 的数据模型和 PowerPoint 存下的绘图都改了，子节点仍是缩进一级的段落', saErr, saNote)
 
   // ------------------------------------------- readers other than quire
-  const files = ['report.docx', 'budget.xlsx', 'deck.pptx']
+  const files = ['report.docx', 'budget.xlsx', 'deck.pptx', 'review.docx', 'flow.pptx']
   if (haveTextutil) files.push('legacy.docx')
   const bad = []
   for (const f of files) {
     try { await run({}, ws, 'unzip', ['-tq', f]) } catch (e) { bad.push(f + ': ' + e.message) }
   }
-  s.step('unzip -t：四个文件都是完整的 zip', check(!bad.length, goList(bad)), files.join('、'))
+  s.step('unzip -t：所有文件都是完整的 zip', check(!bad.length, goList(bad)), files.join('、'))
 
   if (haveTextutil) {
     let txt = ''
@@ -288,7 +355,7 @@ async function suite (s, cleanup) {
     if (!perr) {
       s.step('python-docx / openpyxl 读：段落与表格、工作表名、公式缓存值（data_only）', check(
         out.includes('docx-title=季度报告（终稿）') && out.includes('docx-cell=101') &&
-        out.includes('sheets=明细,汇总,备注') && out.includes('total=54400') && out.includes('formula==明细!D4'), out), out.trim())
+        out.includes('sheets=明细,汇总,备注') && out.includes('total=56400') && out.includes('formula==明细!D5'), out), out.trim())
     } else if (out.includes('ModuleNotFoundError')) {
       s.appendix += '\n本机 python3 没有 python-docx/openpyxl，跳过这一项核对。\n'
     } else {
@@ -301,7 +368,7 @@ async function suite (s, cleanup) {
     fs.mkdirSync(ql, { recursive: true })
     const made = []
     let qerr = null
-    for (const f of ['report.docx', 'budget.xlsx', 'deck.pptx']) {
+    for (const f of ['report.docx', 'budget.xlsx', 'deck.pptx', 'flow.pptx']) {
       if (!fs.existsSync(path.join(ws, f))) {
         qerr = new Error(`stat ${f}: no such file or directory`)
         continue
@@ -320,7 +387,7 @@ async function suite (s, cleanup) {
       keep(png, 'vanilla-ql-' + f + '.png')
       made.push('vanilla-ql-' + f + '.png')
     }
-    s.step('Quick Look（macOS 的 Office 渲染器）给三个文件各出一张缩略图', qerr, made.join('、'))
+    s.step('Quick Look（macOS 的 Office 渲染器）给四个文件各出一张缩略图', qerr, made.join('、'))
     for (const m of made) s.appendix += `\n![${m}](${m})\n`
   }
 

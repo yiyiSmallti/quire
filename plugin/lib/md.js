@@ -1,5 +1,6 @@
-// The Markdown subset Agents write documents in (SPEC 3.2), parsed into
-// blocks of inline runs that the Word writer turns into paragraphs.
+// The Markdown subset Agents write documents in (listed in the docx_create
+// tool description), parsed into blocks of inline runs that the Word writer
+// turns into paragraphs.
 
 // Block: { type: 'heading', level, runs } | { type: 'paragraph', runs }
 //   | { type: 'item', ordered, level, list, runs } | { type: 'quote', runs }
