@@ -36,7 +36,7 @@ dsh plugin --profile web add "git+https://github.com/yiyiSmallti/quire.git#main&
 ```
 
 ```bash
-dsh plugin --profile <profile> add plugin/precinct-quire-0.1.1.tgz
+dsh plugin --profile <profile> add plugin/precinct-quire-0.1.2.tgz
 ```
 
 ## Agent 工具

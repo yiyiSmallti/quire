@@ -1,6 +1,6 @@
 {
   "name": "@precinct/quire",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "文档：让 dsh 的 Agent 读、建、改 Word、Excel 和 PowerPoint 文件；dsh web 侧栏里可直接预览、编辑和标注",
   "keywords": [
     "dsh",
